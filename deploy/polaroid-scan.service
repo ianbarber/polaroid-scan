@@ -1,0 +1,23 @@
+# systemd user unit for the Polaroid Scan local server.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/polaroid-scan.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now polaroid-scan
+#   loginctl enable-linger $USER     # keep it running when logged out
+#
+# %h expands to your home directory — adjust the path if you cloned elsewhere.
+
+[Unit]
+Description=Polaroid Scan — glare-free print scanner (local server)
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 %h/polaroid-scanner/server.py
+WorkingDirectory=%h/polaroid-scanner
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

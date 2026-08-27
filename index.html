@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<meta name="theme-color" content="#0a0a0b" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<title>Polaroid Scan — glare-free</title>
+<link rel="manifest" href="manifest.json" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="mark">◐</span>
+    <span class="name">Polaroid Scan</span>
+    <span class="sub">glare-free</span>
+  </div>
+  <div class="top-actions">
+    <select id="formatSelect" aria-label="Film format">
+      <option value="polaroid" selected>Polaroid 600 / i-Type</option>
+      <option value="polaroid-go">Polaroid Go</option>
+      <option value="instax-mini">Instax Mini</option>
+      <option value="instax-square">Instax Square</option>
+      <option value="instax-wide">Instax Wide</option>
+      <option value="custom">Custom</option>
+    </select>
+    <button id="helpBtn" class="ghost" aria-label="Help">?</button>
+  </div>
+</header>
+
+<main class="stage">
+  <div class="viewport">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay" aria-hidden="true"></canvas>
+    <canvas id="processing" class="hidden"></canvas>
+
+    <div id="guide" class="guide" aria-hidden="true">
+      <div class="guide-frame bad">
+        <div class="corner tl"></div><div class="corner tr"></div>
+        <div class="corner bl"></div><div class="corner br"></div>
+      </div>
+    </div>
+
+    <div id="captureProgress" class="capture-progress hidden" aria-live="polite">
+      <div class="bar"><div id="progressBar"></div></div>
+      <span id="progressText">0 / 12</span>
+    </div>
+
+    <div id="liveStats" class="stats hidden">
+      <span id="statFrames">0 frames</span>
+      <span id="statSharp">sharp —</span>
+      <span id="statGlare">bright —</span>
+      <span id="statDrift">no border</span>
+    </div>
+
+    <div id="hint" class="hint">Tap <b>Start camera</b>, then fit the print inside the frame</div>
+  </div>
+
+  <section class="controls">
+    <div class="row primary-row">
+      <button id="startBtn" class="primary">Start camera</button>
+      <button id="captureBtn" class="primary hidden">● Scan</button>
+      <button id="stopBtn" class="ghost hidden">Stop</button>
+      <button id="switchBtn" class="ghost" title="Switch camera">↻</button>
+      <button id="editCornersBtn" class="ghost hidden" title="Set corners manually — drag the yellow dots">✢</button>
+      <button id="settingsToggle" class="ghost" aria-expanded="false" aria-controls="settingsDrawer" title="Settings">⚙</button>
+    </div>
+    <div id="settingsDrawer" class="settings-drawer hidden">
+      <div class="row small">
+        <label class="toggle"><input type="checkbox" id="autoDetect" checked /> auto-detect border</label>
+        <label class="toggle"><input type="checkbox" id="hiRes" checked /> hi-res output</label>
+      </div>
+      <div class="range">
+        <label>Glare rejection <input id="glareRange" type="range" min="0" max="100" value="65" /></label>
+        <span id="glareVal">65%</span>
+      </div>
+      <p class="settings-note">Higher = more aggressive at removing reflections (needs more tilt variety). Changing it re-processes the last scan.</p>
+      <div class="row small settings-debug">
+        <label class="toggle"><input type="checkbox" id="useStills" /> full-res stills (Android, slower)</label>
+        <label class="toggle"><input type="checkbox" id="debugSave" /> debug: save frames + stats</label>
+        <a href="debug/" target="_blank" class="debug-link hidden" id="debugLink">View debug saves</a>
+      </div>
+    </div>
+    <div id="captureStrip" class="strip"></div>
+  </section>
+
+  <section id="resultPanel" class="result hidden">
+    <div class="result-head">
+      <h2>Scan result</h2>
+      <div class="result-actions">
+        <button id="saveBtn" class="primary">Save to Photos</button>
+        <button id="downloadBtn" class="secondary">Download JPEG</button>
+        <button id="copyBtn" class="ghost">Copy</button>
+        <button id="retakeBtn" class="ghost">Retake</button>
+      </div>
+    </div>
+    <div class="result-body">
+      <canvas id="resultCanvas"></canvas>
+      <div class="tweaks">
+        <div class="seg" id="frameSeg" role="group" aria-label="Frame">
+          <button data-v="frame" class="seg-active">With frame</button>
+          <button data-v="image">Image only</button>
+        </div>
+        <label>Edge trim <input id="cropRange" type="range" min="0" max="24" value="0" /></label>
+        <label>Exposure <input id="expRange" type="range" min="-40" max="40" value="0" /></label>
+        <label>Warmth <input id="warmRange" type="range" min="-30" max="30" value="0" /></label>
+        <div class="meta" id="metaText"></div>
+        <div class="meta diag" id="diagText"></div>
+      </div>
+    </div>
+    <p class="footnote">On iPhone, “Save to Photos” opens the share sheet → Save Image.</p>
+  </section>
+</main>
+
+<div id="helpSheet" class="sheet hidden" role="dialog" aria-modal="true">
+  <div class="sheet-card">
+    <h3>How to scan</h3>
+    <ol class="help-steps">
+      <li>Lay the print flat on a <b>plain surface that contrasts with its border</b> (dark table for white borders, light table for black frames) in soft light.</li>
+      <li>Fit the print inside the frame until the outline turns <b style="color:#2ecc71">green</b>. White, black, and patterned borders all work.</li>
+      <li>Tap <b>Scan</b>, then hold the phone level and <b>slowly circle it over the print</b> — like stirring a pot — for a few seconds. The reflections drift to different spots and the app keeps only the clean parts. If it says the reflection is stuck, add a little tilt as you circle.</li>
+      <li>It finishes on its own (12 frames or ~9 s). Tap <b>Finish scan</b> to stop early.</li>
+    </ol>
+    <p class="help-note">Green outline = border found and locked. Yellow = lost it briefly. No outline after a few seconds → tap ✢ and drag the corners yourself.</p>
+    <details>
+      <summary>Phone access (camera needs HTTPS)</summary>
+      <ol class="help-steps">
+        <li>Run <code>python3 server.py</code> in this folder</li>
+        <li>Put HTTPS in front — e.g. <code>tailscale serve https / --bg --set-path / --proxy 8000</code>, Caddy, or any static host. Plain <code>http://localhost</code> works for on-device testing.</li>
+        <li id="publicUrlLine" class="hidden">This server: <code id="publicUrl"></code></li>
+        <li>Add to Home Screen for full-screen</li>
+      </ol>
+    </details>
+    <button id="closeHelp" class="primary">Got it</button>
+  </div>
+</div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

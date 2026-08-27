@@ -1,0 +1,8 @@
+# machine-local
+config.json
+debug/
+# tooling
+__pycache__/
+*.pyc
+node_modules/
+.DS_Store
