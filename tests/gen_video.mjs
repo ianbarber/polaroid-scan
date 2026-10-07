@@ -6,8 +6,9 @@ let seed = 777;
 function rnd() { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; }
 
 const PW = 880, PH = 1070, BORD = { l: 45, r: 45, t: 60, b: 220 };
-const style = process.argv[6] || 'white'; // white | black | pattern
+const style = process.argv[6] || 'white'; // white | black | pattern | gold
 function borderCol(x, y) {
+  if (style === 'gold') { const v = 0.75 + 0.35 * Math.cos((x + 0.6 * y) / 300) + 0.05 * Math.sin(y * 0.9); return [205 * v, 168 * v, 88 * v]; } // metallic sheen
   if (style === 'black') { const v = 22 + 4 * Math.sin(x * 0.02 + y * 0.013); return [v, v, v + 3]; }
   if (style === 'pattern') {
     const k = Math.floor((x + y) / 42) % 3;
@@ -32,7 +33,7 @@ for (let y = 0; y < PH; y++) for (let x = 0; x < PW; x++) {
 }
 
 const CW = +(process.argv[2] || 1280), CH = +(process.argv[3] || 960), N = +(process.argv[4] || 60);
-const table = (process.argv[5] === 'beige') ? [228, 220, 200] : [120, 95, 70];
+const table = (process.argv[5] === 'beige') ? [228, 220, 200] : (process.argv[5] === 'black') ? [24, 22, 22] : [120, 95, 70];
 const out = new Uint8ClampedArray(CW * CH * 4);
 // base placement: print ~ 62% of frame height, centred
 const ph = CH * 0.8, pw = ph * PW / PH;

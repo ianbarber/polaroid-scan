@@ -7,8 +7,9 @@ function rnd() { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 42949
 
 // ---- ground-truth print texture (outer 880×1070 px = 88×107mm @10px/mm)
 const PW = 880, PH = 1070, BORD = { l: 45, r: 45, t: 55, b: 225 };
-const style = process.argv[5] || 'white'; // white | black | pattern
+const style = process.argv[5] || 'white'; // white | black | pattern | gold
 function borderCol(x, y) {
+  if (style === 'gold') { const v = 1 + 0.06 * Math.sin(y * 0.9 + x * 0.05); return [205 * v, 168 * v, 88 * v]; } // brushed metallic
   if (style === 'black') { const v = 22 + 4 * Math.sin(x * 0.02 + y * 0.013); return [v, v, v + 3]; }
   if (style === 'pattern') {
     const k = Math.floor((x + y) / 42) % 3;
@@ -38,6 +39,8 @@ writePNG(process.argv[2] + '/gt.png', print, PW, PH);
 
 // ---- camera frame renderer: maps camera px -> print px via inverse homography
 const CW = 1920, CH = 1440;
+// metallic borders: brightness swings with view angle — a broad per-frame sheen band across the print
+let sheen = null;
 function renderFrame(cornersCam, glare, tableRGB, noise, blur) {
   // cornersCam: TL,TR,BR,BL in camera coords where print corners land
   const Hc2p = V.solveHomography(cornersCam, V.rectQuad(PW, PH)); // camera -> print
@@ -56,6 +59,10 @@ function renderFrame(cornersCam, glare, tableRGB, noise, blur) {
       r = print[i00] * w00 + print[i10] * w10 + print[i01] * w01 + print[i11] * w11;
       g = print[i00 + 1] * w00 + print[i10 + 1] * w10 + print[i01 + 1] * w01 + print[i11 + 1] * w11;
       b = print[i00 + 2] * w00 + print[i10 + 2] * w10 + print[i01 + 2] * w01 + print[i11 + 2] * w11;
+      if (sheen && !(p.x >= BORD.l && p.x < PW - BORD.r && p.y >= BORD.t && p.y < PH - BORD.b)) {
+        const f = sheen.lo + (sheen.hi - sheen.lo) * (0.5 + 0.5 * Math.cos((p.x * sheen.dx + p.y * sheen.dy) / 260 + sheen.ph));
+        r *= f; g *= f; b *= f;
+      }
       // specular glare (camera space gaussian) only on the glossy print
       for (const gl of glare) {
         const d2 = ((x - gl.x) ** 2) / (gl.rx ** 2) + ((y - gl.y) ** 2) / (gl.ry ** 2);
@@ -95,9 +102,9 @@ function downscaleLuma(frame, tw) {
 
 // ---- scenario
 const outDir = process.argv[2];
-const table = process.argv[3] === 'beige' ? [232, 225, 208] : [130, 105, 75];
+const table = process.argv[3] === 'beige' ? [232, 225, 208] : process.argv[3] === 'black' ? [24, 22, 22] : [130, 105, 75];
 const K = +(process.argv[4] || 9);
-const base = [{ x: 560, y: 140 }, { x: 1360, y: 140 }, { x: 1360, y: 1300 }, { x: 560, y: 1300 }];
+const base = [{ x: 560, y: 180 }, { x: 1360, y: 180 }, { x: 1360, y: 1153 }, { x: 560, y: 1153 }]; // 800×973 = true 88:107 aspect
 const frames = [], gtQuads = [];
 let detErr = [], detFail = 0;
 const t0 = Date.now();
@@ -106,6 +113,7 @@ for (let k = 0; k < K; k++) {
   const corners = base.map(p => ({ x: p.x + (rnd() - 0.5) * jit * 2, y: p.y + (rnd() - 0.5) * jit * 2 }));
   const ang = k / K * Math.PI * 2;
   const glare = [{ x: 960 + Math.cos(ang) * 260, y: 720 + Math.sin(ang) * 300, rx: 170 + rnd() * 80, ry: 140 + rnd() * 80, amp: 210 }];
+  if (style === 'gold') { const a = rnd() * Math.PI; sheen = { lo: +(process.env.GOLD_LO || 0.45), hi: 1.2, dx: Math.cos(a), dy: Math.sin(a), ph: rnd() * 6.28 }; }
   const f = renderFrame(corners, glare, table, 10, 0);
   gtQuads.push(corners);
   if (k === 0) writePNG(outDir + '/frame0.png', f.data, f.w, f.h);
@@ -117,10 +125,17 @@ for (let k = 0; k < K; k++) {
     x: (base[0].x - 60) / ds.scale, y: (base[0].y - 60) / ds.scale,
     w: (base[1].x - base[0].x + 120) / ds.scale, h: (base[3].y - base[0].y + 120) / ds.scale,
   };
+  if (process.env.SEEDOFF) { seed.x += +process.env.SEEDOFF * seed.w; seed.y += 0.5 * +process.env.SEEDOFF * seed.h; } // print not centred in the guide
   const det = V.detectBorder(ds.luma, ds.w, ds.h, { region, expectedRatio: 88 / 107, rgba: ds.rgba, seed, debug: !!process.env.DBG });
   const dt = Date.now() - td;
   if (!det) { detFail++; console.log(`frame ${k}: DETECT FAIL (${dt}ms)`); continue; }
   const q = det.quad.map(p => ({ x: p.x * ds.scale, y: p.y * ds.scale }));
+  if (process.env.DUMP == k) { // downscaled frame with detected (green) and true (red) quads
+    const im = ds.rgba.slice();
+    const draw = (qq, col) => { for (let i = 0; i < 4; i++) { const a = qq[i], b = qq[(i + 1) % 4]; for (let t = 0; t <= 1; t += 0.002) { const x = Math.round((a.x + (b.x - a.x) * t) / ds.scale), y = Math.round((a.y + (b.y - a.y) * t) / ds.scale); if (x >= 0 && y >= 0 && x < ds.w && y < ds.h) im.set(col, (y * ds.w + x) * 4); } } };
+    draw(corners, [255, 0, 0]); draw(q, [0, 255, 0]);
+    writePNG(outDir + '/dump.png', im, ds.w, ds.h);
+  }
   const err = q.map((p, i) => Math.hypot(p.x - corners[i].x, p.y - corners[i].y));
   detErr.push(...err);
   console.log(`frame ${k}: ${det.mode} t${det.thresh} score ${det.score.toFixed(3)} inl ${det.inliers.toFixed(2)} ratio ${det.ratio.toFixed(3)} sharp ${det.sharp.toFixed(0)} corner err px: ${err.map(e => e.toFixed(1)).join(' ')} (${dt}ms)`);
@@ -129,6 +144,7 @@ for (let k = 0; k < K; k++) {
 console.log(`render+detect: ${Date.now() - t0}ms, detect fails ${detFail}/${K}, mean corner err ${(detErr.reduce((a, b) => a + b, 0) / detErr.length).toFixed(2)}px, max ${Math.max(...detErr).toFixed(2)}px`);
 
 // ---- fuse
+if (process.env.NOFUSE) process.exit(0);
 if (frames.length < 2) { console.log('fewer than 2 frames detected — skipping fusion'); process.exit(1); }
 const outW = 1809, outH = 2200;
 const borders = { l: 45 / 880, r: 45 / 880, t: 55 / 1070, b: 225 / 1070 };

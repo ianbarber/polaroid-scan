@@ -9,6 +9,7 @@ const path = require('path');
   const url = process.argv[4] || 'http://localhost:8000/';
   const browser = await chromium.launch({
     headless: true,
+    executablePath: process.env.CHROME_PATH || undefined,
     args: [
       '--use-fake-device-for-media-stream',
       '--use-fake-ui-for-media-stream',

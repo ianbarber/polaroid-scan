@@ -198,6 +198,14 @@ export function detectBorder(luma, W, H, opts) {
     }
     if (dbg) dbg('after dark:', best ? `${best.mode} score ${best.score.toFixed(3)}` : 'none');
   }
+  // silhouette: the print as a whole vs a plain table, by colour distance from the table colour.
+  // Catches borders whose luma is neither the brightest nor the darkest thing in view — metallic
+  // (gold/silver foil) frames whose brightness swings with angle, coloured borders, etc.
+  if (!best || best.score > 0.12) {
+    const sil = opts.rgba && tableColour(opts.rgba, W, reg);
+    if (sil) consider(findRing(luma, W, reg, sil.thr, expected, scratch, 2, sil, opts.rgba));
+    if (dbg) dbg('after silhouette:', sil ? `bg ${sil.bg.map(Math.round)} thr ${sil.thr.toFixed(0)}` : 'no plain table', best ? `${best.mode} score ${best.score.toFixed(3)}` : 'none');
+  }
   if (!best || best.score > 0.2) {
     consider(findByEdges(luma, opts.rgba, W, H, reg, expected, opts.seed, dbg));
     if (dbg) dbg('after edges:', best ? `${best.mode} score ${best.score.toFixed(3)}` : 'none');
@@ -234,8 +242,28 @@ export function glareStats(luma, W, H, quad) {
   return { frac: on / n, u, v };
 }
 
-// pol: 1 = bright ring (white border), -1 = dark ring (black frame).
-function findRing(luma, W, reg, t, expected, scratch, pol) {
+// Table colour = median RGB of a thin band around the region's perimeter, if that band is plain
+// enough (most of it close to the median). Returns { bg, thr } or null.
+function tableColour(rgba, W, reg) {
+  const m = Math.max(2, Math.round(Math.min(reg.w, reg.h) * 0.03));
+  const rs = [], gs = [], bs = [];
+  const push = (x, y) => { const i = (y * W + x) * 4; rs.push(rgba[i]); gs.push(rgba[i + 1]); bs.push(rgba[i + 2]); };
+  const sx = Math.max(1, Math.round(reg.w / 120)), sy = Math.max(1, Math.round(reg.h / 120));
+  for (let d = 0; d < m; d += 2) {
+    for (let x = reg.x; x < reg.x + reg.w; x += sx) { push(x, reg.y + d); push(x, reg.y + reg.h - 1 - d); }
+    for (let y = reg.y; y < reg.y + reg.h; y += sy) { push(reg.x + d, y); push(reg.x + reg.w - 1 - d, y); }
+  }
+  const med = a => a.slice().sort((p, q) => p - q)[a.length >> 1];
+  const bg = [med(rs), med(gs), med(bs)];
+  const dist = rs.map((r, i) => Math.abs(r - bg[0]) + Math.abs(gs[i] - bg[1]) + Math.abs(bs[i] - bg[2])).sort((p, q) => p - q);
+  const d50 = dist[dist.length >> 1], d80 = dist[Math.floor(dist.length * 0.8)];
+  if (d80 > 60) return null; // busy/patterned surface, or the print fills the frame
+  return { bg, thr: Math.max(30, 2.5 * d80, 5 * d50) };
+}
+
+// pol: 1 = bright ring (white border), -1 = dark ring (black frame),
+// 2 = silhouette: mask = colour far from the table colour sil.bg (needs rgba).
+function findRing(luma, W, reg, t, expected, scratch, pol, sil = null, rgba = null) {
   const rw = reg.w, rh = reg.h, n = rw * rh;
   if (!scratch.mask || scratch.mask.length < n) {
     scratch.mask = new Uint8Array(n); scratch.label = new Int32Array(n); scratch.stack = new Int32Array(n);
@@ -243,7 +271,13 @@ function findRing(luma, W, reg, t, expected, scratch, pol) {
   const mask = scratch.mask, label = scratch.label, stack = scratch.stack;
   for (let y = 0; y < rh; y++) {
     const row = (reg.y + y) * W + reg.x, o = y * rw;
-    for (let x = 0; x < rw; x++) mask[o + x] = (pol > 0 ? luma[row + x] > t : luma[row + x] < t) ? 1 : 0;
+    if (pol === 2) {
+      const [br, bgc, bb] = sil.bg;
+      for (let x = 0; x < rw; x++) {
+        const i = (row + x) * 4;
+        mask[o + x] = Math.abs(rgba[i] - br) + Math.abs(rgba[i + 1] - bgc) + Math.abs(rgba[i + 2] - bb) > t ? 1 : 0;
+      }
+    } else for (let x = 0; x < rw; x++) mask[o + x] = (pol > 0 ? luma[row + x] > t : luma[row + x] < t) ? 1 : 0;
   }
   label.fill(-1, 0, n);
   const comps = [];
@@ -280,6 +314,7 @@ function findRing(luma, W, reg, t, expected, scratch, pol) {
     const lumaAt = (x, y) => luma[(reg.y + y) * W + reg.x + x];
     const id = c.id;
     const sub = (off, on) => { // sub-pixel crossing of t between the off pixel and the on pixel
+      if (pol === 2) return 0.5; // colour mask: the gradient refinement below does the sub-pixel work
       const d = on - off; return Math.abs(d) > 1e-3 ? Math.min(1, Math.max(0, (t - off) / d)) : 0.5;
     };
     // boundary samples — scan inward from the bbox edge for first pixel of this component
@@ -316,10 +351,15 @@ function findRing(luma, W, reg, t, expected, scratch, pol) {
     if (q.some(p => !isFinite(p.x) || !isFinite(p.y))) continue;
     // refine every edge on the luma gradient (threshold-independent, sub-pixel)
     const qImg = q.map(p => ({ x: p.x + reg.x, y: p.y + reg.y }));
-    const refined = refineQuadByGradient(luma, W, luma.length / W, qImg, pol);
+    let refined;
+    if (pol === 2) { // silhouette edge may be a luma step or only a colour step: keep the tighter fit
+      const rc = refineQuadByGradient(luma, W, luma.length / W, qImg, 0, rgba), rl = refineQuadByGradient(luma, W, luma.length / W, qImg, 0);
+      refined = !rc ? rl : !rl ? rc : (rl.spread - rl.inliers < rc.spread - rc.inliers ? rl : rc);
+    } else refined = refineQuadByGradient(luma, W, luma.length / W, qImg, pol);
     if (refined) q = refined.quad.map(p => ({ x: p.x - reg.x, y: p.y - reg.y }));
     // band check: just inside each edge must be "on" (bright border), just outside must be darker
-    const band = bandCheck(luma, W, luma.length / W, q.map(p => ({ x: p.x + reg.x, y: p.y + reg.y })), t, pol);
+    const band = pol === 2 ? silBandCheck(rgba, W, luma.length / W, q.map(p => ({ x: p.x + reg.x, y: p.y + reg.y })), sil)
+      : bandCheck(luma, W, luma.length / W, q.map(p => ({ x: p.x + reg.x, y: p.y + reg.y })), t, pol);
     if (band.insideFrac < 0.7 || band.contrast < 5) continue;
     // geometry sanity: convex-ish, angles in [60°,120°]
     let okGeom = true;
@@ -348,11 +388,14 @@ function findRing(luma, W, reg, t, expected, scratch, pol) {
     const inliers = refined ? refined.inliers : (lt.inliers + lb.inliers + ll.inliers + lr.inliers) / 4;
     const qImg2 = q.map(p => ({ x: p.x + reg.x, y: p.y + reg.y }));
     const interior = interiorPenalty(luma, W, luma.length / W, qImg2);
-    const score = ratioErr * 1.5 + (1 - inliers) * 0.6 + Math.max(0, centerFill - 0.2) * 0.8 + (1 - band.insideFrac) * 0.5 + interior;
+    // a silhouette is solid by design (the photo differs from the table too), so no ring check;
+    // the small constant keeps a genuine bright/dark ring preferred when both exist
+    const fillPen = pol === 2 ? 0.06 : Math.max(0, centerFill - 0.2) * 0.8;
+    const score = ratioErr * 1.5 + (1 - inliers) * 0.6 + fillPen + (1 - band.insideFrac) * 0.5 + interior;
     if (!best || score < best.score) {
       best = {
         quad: q.map(p => ({ x: p.x + reg.x, y: p.y + reg.y })),
-        score, thresh: t, inliers, centerFill, ratio, band, rotated, mode: pol > 0 ? 'ring-bright' : 'ring-dark',
+        score, thresh: pol === 2 ? -2 : t, inliers, centerFill, ratio, band, rotated, mode: pol === 2 ? 'silhouette' : pol > 0 ? 'ring-bright' : 'ring-dark',
       };
     }
   }
@@ -564,6 +607,30 @@ function bandCheck(luma, W, H, q, t, pol = 1) {
     }
   }
   return { insideFrac: on / tot, contrast: (inSum - outSum) / tot * (pol > 0 ? 1 : -1) };
+}
+
+// bandCheck for silhouettes: just inside each edge must be far from the table colour, just outside near it.
+function silBandCheck(rgba, W, H, q, sil) {
+  const c = quadCenter(q);
+  const size = Math.min(Math.hypot(q[1].x - q[0].x, q[1].y - q[0].y), Math.hypot(q[3].x - q[0].x, q[3].y - q[0].y));
+  const off = Math.max(2.5, Math.min(8, size * 0.02));
+  const px3 = [0, 0, 0];
+  const dist = (x, y) => { sampleRGB(rgba, W, H, x, y, px3); return Math.abs(px3[0] - sil.bg[0]) + Math.abs(px3[1] - sil.bg[1]) + Math.abs(px3[2] - sil.bg[2]); };
+  let on = 0, tot = 0, inSum = 0, outSum = 0;
+  for (let i = 0; i < 4; i++) {
+    const p0 = q[i], p1 = q[(i + 1) % 4];
+    const L = Math.hypot(p1.x - p0.x, p1.y - p0.y);
+    let nx = -(p1.y - p0.y) / L, ny = (p1.x - p0.x) / L;
+    const mx = (p0.x + p1.x) / 2, my = (p0.y + p1.y) / 2;
+    if ((mx - c.x) * nx + (my - c.y) * ny < 0) { nx = -nx; ny = -ny; }
+    for (let s = 0; s < 24; s++) {
+      const tt = 0.06 + 0.88 * (s + 0.5) / 24;
+      const px = p0.x + (p1.x - p0.x) * tt, py = p0.y + (p1.y - p0.y) * tt;
+      const din = dist(px - nx * off, py - ny * off), dout = dist(px + nx * off, py + ny * off);
+      tot++; if (din > sil.thr && dout < sil.thr) on++; inSum += din; outSum += dout;
+    }
+  }
+  return { insideFrac: on / tot, contrast: (inSum - outSum) / tot };
 }
 
 // Fallback for patterned/low-contrast borders: for each side, search (offset × slope) candidate
