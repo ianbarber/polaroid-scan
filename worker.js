@@ -12,7 +12,7 @@ self.onmessage = (e) => {
       const n = m.w * m.h;
       if (!scratch.luma || scratch.luma.length !== n) scratch.luma = new Uint8Array(n);
       const luma = V.rgbaToLuma(rgba, n, scratch.luma);
-      const result = V.detectBorder(luma, m.w, m.h, { region: m.region, expectedRatio: m.expectedRatio, lastThresh: m.lastThresh, seed: m.seed, rgba, scratch });
+      const result = V.detectBorder(luma, m.w, m.h, { region: m.region, expectedRatio: m.expectedRatio, lastThresh: m.lastThresh, seed: m.seed, borders: m.borders, rgba, scratch });
       self.postMessage({ id: m.id, type: 'detect', result });
     } else if (m.type === 'fuse') {
       const frames = m.frames.map(f => ({ data: new Uint8ClampedArray(f.data), w: f.w, h: f.h, quad: f.quad, sharp: f.sharp }));

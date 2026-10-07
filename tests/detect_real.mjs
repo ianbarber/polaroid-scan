@@ -21,7 +21,7 @@ for (let y = 0; y < th; y++) for (let x = 0; x < tw; x++) {
 const region = { x: tw * 0.05, y: th * 0.03, w: tw * 0.9, h: th * 0.94 };
 const t0 = Date.now();
 const seed = { x: tw * 0.15, y: th * 0.1, w: tw * 0.7, h: th * 0.8 };
-const det = V.detectBorder(luma, tw, th, { region, expectedRatio: 88 / 107, rgba, seed });
+const det = V.detectBorder(luma, tw, th, { region, expectedRatio: 88 / 107, rgba, seed, borders: process.env.NOWIN ? null : { l: 4.5 / 88, r: 4.5 / 88, t: 6 / 107, b: 22 / 107 } });
 console.log(`${raw}: ${Date.now() - t0}ms`, det ? { mode: det.mode, thresh: det.thresh, score: det.score.toFixed(3), inliers: det.inliers.toFixed(2), ratio: det.ratio.toFixed(3), centerFill: det.centerFill.toFixed(2), band: det.band, sharp: det.sharp.toFixed(0), quad: det.quad.map(p => `${(p.x * s).toFixed(0)},${(p.y * s).toFixed(0)}`).join(' ') } : 'NO DETECTION');
 if (det && outPng) {
   const out = data.slice();

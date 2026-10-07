@@ -210,7 +210,15 @@ export function detectBorder(luma, W, H, opts) {
     consider(findByEdges(luma, opts.rgba, W, H, reg, expected, opts.seed, dbg));
     if (dbg) dbg('after edges:', best ? `${best.mode} score ${best.score.toFixed(3)}` : 'none');
   }
+  // photo window: when the outer edge is invisible (black frame on a black table, foil reflecting
+  // the table), find the picture itself and extend it outward by the format's border geometry
+  const fr = opts.borders;
+  if (fr && (!best || best.score > 0.25)) {
+    consider(findViaWindow(luma, opts.rgba, W, H, reg, expected, fr, opts.seed, scratch, dbg));
+    if (dbg) dbg('after window:', best ? `${best.mode} score ${best.score.toFixed(3)}` : 'none');
+  }
   if (!best || best.score > 0.5) { if (dbg) dbg('REJECT final', best && best.score); return null; }
+  if (fr && best.mode !== 'window') checkWithWindow(luma, opts.rgba, W, H, best, fr, expected, dbg);
   best.sharp = sharpnessInQuad(luma, W, H, best.quad);
   best.glare = glareStats(luma, W, H, best.quad);
   best.brightFrac = best.glare.frac;
@@ -428,13 +436,15 @@ function quadCenter(q) { return { x: (q[0].x + q[1].x + q[2].x + q[3].x) / 4, y:
 // steps (rgba required) with outermost-step preference, since pattern edges flip polarity and can
 // vanish in luma while staying strong in colour.
 // Fit a robust line through those edge points; intersect adjacent lines.
-function refineQuadByGradient(luma, W, H, q, pol = 1, rgba = null) {
+// o.hw overrides the search half-width; o.strongest takes the strongest colour step instead of the
+// outermost (for the photo window, whose edge sits between the border and the picture).
+function refineQuadByGradient(luma, W, H, q, pol = 1, rgba = null, o = {}) {
   const colorMode = pol === 0 && !!rgba;
   const c = quadCenter(q);
   const size = Math.min(Math.hypot(q[1].x - q[0].x, q[1].y - q[0].y), Math.hypot(q[3].x - q[0].x, q[3].y - q[0].y));
-  const hw = Math.max(3, Math.min(12, Math.round(size * 0.03)));
+  const hw = o.hw || Math.max(3, Math.min(12, Math.round(size * 0.03)));
   const lines = [];
-  let inlSum = 0;
+  let inlSum = 0, strSum = 0;
 
   function fitSide(p0, p1, sidePol, outermost, hwArg) {
     const hwS = hwArg || hw;
@@ -511,7 +521,7 @@ function refineQuadByGradient(luma, W, H, q, pol = 1, rgba = null) {
     const p0 = q[i], p1 = q[(i + 1) % 4];
     let fit;
     if (colorMode) {
-      fit = fitSide(p0, p1, 1, true); // colour steps are unsigned; polarity arg unused
+      fit = fitSide(p0, p1, 1, !o.strongest); // colour steps are unsigned; polarity arg unused
     } else if (pol === 0) {
       const fp = fitSide(p0, p1, 1, true), fm = fitSide(p0, p1, -1, true);
       fit = !fp ? fm : !fm ? fp : (fm.n > fp.n || (fm.n === fp.n && fm.strength > fp.strength) ? fm : fp);
@@ -519,6 +529,7 @@ function refineQuadByGradient(luma, W, H, q, pol = 1, rgba = null) {
       fit = fitSide(p0, p1, pol);
     }
     if (!fit || fit.n < 8) return null;
+    strSum += fit.strength;
     // line from pass 1
     let b0 = { x: p0.x + fit.nx * fit.b, y: p0.y + fit.ny * fit.b };
     let b1 = { x: p1.x + fit.nx * (fit.a * fit.L + fit.b), y: p1.y + fit.ny * (fit.a * fit.L + fit.b) };
@@ -547,7 +558,7 @@ function refineQuadByGradient(luma, W, H, q, pol = 1, rgba = null) {
   if (quad.some(p => !p || !isFinite(p.x) || !isFinite(p.y))) return null;
   // reject if refinement moved any corner absurdly far
   for (let i = 0; i < 4; i++) if (Math.hypot(quad[i].x - q[i].x, quad[i].y - q[i].y) > hw * 2.5) return null;
-  return { quad, inliers: inlSum / 4, spread: spreadSum / 4 };
+  return { quad, inliers: inlSum / 4, spread: spreadSum / 4, strength: strSum / 4 };
 }
 
 // Does another strong edge run parallel just OUTSIDE this quad? True for a quad locked onto the
@@ -713,6 +724,151 @@ function findByEdges(luma, rgba, W, H, reg, expected, seed, dbg) {
   if (dbg) dbg('edges: refined ok, inliers', refined.inliers.toFixed(2), 'spread', refined.spread.toFixed(2), 'ratioErr', ratioErr.toFixed(3), 'interior', interior);
   const score = ratioErr * 1.2 + (1 - refined.inliers) * 0.35 + Math.min(3, refined.spread) * 0.06 + 0.10 + interior;
   return { quad: q, score, thresh: -1, inliers: refined.inliers, centerFill: -1, band: null, ratio, rotated, mode: 'edges' };
+}
+
+// ---------------------------------------------------------------- photo window (inner frame)
+// fr = border widths as fractions of the outer size {l,r,t,b} for the print upright (chin = b).
+// Orientation k = quarter turns clockwise of the print in the image: chin on bottom/left/top/right.
+function orientFr(fr, k) {
+  let { l, r, t, b } = fr;
+  for (let i = 0; i < k; i++) [l, t, r, b] = [b, l, t, r];
+  return { l, r, t, b };
+}
+const winUnit = f => [{ x: f.l, y: f.t }, { x: 1 - f.r, y: f.t }, { x: 1 - f.r, y: 1 - f.b }, { x: f.l, y: 1 - f.b }];
+function windowFromOuter(outer, f) {
+  const Hm = solveHomography(rectQuad(1, 1), outer);
+  return winUnit(f).map(p => applyH(Hm, p.x, p.y));
+}
+function outerFromWindow(win, f) {
+  const Hm = solveHomography(winUnit(f), win);
+  return rectQuad(1, 1).map(p => applyH(Hm, p.x, p.y));
+}
+function quadRatio(q, expected) {
+  const wTop = Math.hypot(q[1].x - q[0].x, q[1].y - q[0].y), wBot = Math.hypot(q[2].x - q[3].x, q[2].y - q[3].y);
+  const hL = Math.hypot(q[3].x - q[0].x, q[3].y - q[0].y), hR = Math.hypot(q[2].x - q[1].x, q[2].y - q[1].y);
+  const ratio = (wTop + wBot) / (hL + hR);
+  const errA = Math.abs(ratio - expected) / expected, errB = Math.abs(ratio - 1 / expected) * expected;
+  return { ratio, err: Math.min(errA, errB), rotated: errB < errA, w: (wTop + wBot) / 2, h: (hL + hR) / 2 };
+}
+// How far side i of quad B strays from the line of side i of quad A (px, max of two probe points).
+function sideGap(A, B, i) {
+  const a0 = A[i], a1 = A[(i + 1) % 4], b0 = B[i], b1 = B[(i + 1) % 4];
+  const L = Math.hypot(a1.x - a0.x, a1.y - a0.y) || 1;
+  let worst = 0;
+  for (const t of [0.25, 0.75]) {
+    const px = b0.x + (b1.x - b0.x) * t, py = b0.y + (b1.y - b0.y) * t;
+    worst = Math.max(worst, Math.abs((a1.x - a0.x) * (py - a0.y) - (a1.y - a0.y) * (px - a0.x)) / L);
+  }
+  return worst;
+}
+// Median colour step across the segment p0→p1 (how much of a real edge lies exactly there).
+function lineSupport(rgba, W, H, p0, p1) {
+  const L = Math.hypot(p1.x - p0.x, p1.y - p0.y) || 1;
+  const nx = -(p1.y - p0.y) / L, ny = (p1.x - p0.x) / L;
+  const a = [0, 0, 0], b = [0, 0, 0], vals = [];
+  for (let s = 0; s < 20; s++) {
+    const t = 0.1 + 0.8 * (s + 0.5) / 20;
+    const px = p0.x + (p1.x - p0.x) * t, py = p0.y + (p1.y - p0.y) * t;
+    let best = 0;
+    for (let d = -1; d <= 1; d++) {
+      sampleRGB(rgba, W, H, px + nx * (d + 2), py + ny * (d + 2), a);
+      sampleRGB(rgba, W, H, px + nx * (d - 2), py + ny * (d - 2), b);
+      best = Math.max(best, Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]) + Math.abs(a[2] - b[2]));
+    }
+    vals.push(best);
+  }
+  vals.sort((x, y) => x - y);
+  return vals[vals.length >> 1];
+}
+function lineX(a0, a1, b0, b1) {
+  const dax = a1.x - a0.x, day = a1.y - a0.y, dbx = b1.x - b0.x, dby = b1.y - b0.y;
+  const den = dax * dby - day * dbx;
+  if (Math.abs(den) < 1e-9) return null;
+  const t = ((b0.x - a0.x) * dby - (b0.y - a0.y) * dbx) / den;
+  return { x: a0.x + dax * t, y: a0.y + day * t };
+}
+
+// Given an accepted outer quad, look for the photo window where the format says it should be.
+// Agreement confirms the detection. If exactly one outer side disagrees with the side the window
+// implies, and the window is crisp and the implied line sits on a stronger edge, that side was
+// mis-fitted (e.g. dark foil fading into a wood table) — replace it.
+function checkWithWindow(luma, rgba, W, H, best, fr, expected, dbg) {
+  if (!rgba) return;
+  const q = best.quad, g = quadRatio(q, expected);
+  let win = null;
+  for (const k of best.rotated ? [1, 3] : [0, 2]) {
+    const f = orientFr(fr, k);
+    const minB = Math.min(f.l * g.w, f.r * g.w, f.t * g.h, f.b * g.h);
+    const hw = Math.max(3, Math.min(10, Math.round(0.45 * minB)));
+    const pred = windowFromOuter(q, f);
+    const r = refineQuadByGradient(luma, W, H, pred, 0, rgba, { hw, strongest: true });
+    if (!r) continue;
+    // the right orientation needs little adjustment; a wrong chin side drags edges a long way
+    const move = r.quad.reduce((a, p, j) => a + Math.hypot(p.x - pred[j].x, p.y - pred[j].y), 0) / 4;
+    const qual = r.inliers - 0.1 * r.spread - 0.4 * move / hw;
+    if (!win || qual > win.qual) win = { ...r, k, qual };
+  }
+  if (!win) { if (dbg) dbg('window: not found'); return; }
+  const implied = outerFromWindow(win.quad, orientFr(fr, win.k));
+  const tol = Math.max(2, 0.025 * Math.min(g.w, g.h));
+  const gaps = [0, 1, 2, 3].map(i => sideGap(q, implied, i));
+  const bad = [0, 1, 2, 3].filter(i => gaps[i] > tol);
+  const strong = win.inliers >= 0.8 && win.spread <= 1.2;
+  if (dbg) dbg(`window k${win.k} inl ${win.inliers.toFixed(2)} spread ${win.spread.toFixed(2)} gaps ${gaps.map(v => v.toFixed(1)).join(' ')} tol ${tol.toFixed(1)}`);
+  if (!bad.length) { best.inner = win.quad; best.score = Math.max(0, best.score - 0.05); best.mode += '+win'; return; }
+  if (!strong) return;
+  // replace a disagreeing side only where the detected line is not on a clearly real edge — so a
+  // wrong format choice (every detected side crisp, implied ones off-edge) never moves anything
+  const swap = bad.filter(i => {
+    const supDet = lineSupport(rgba, W, H, q[i], q[(i + 1) % 4]), supImp = lineSupport(rgba, W, H, implied[i], implied[(i + 1) % 4]);
+    if (dbg) dbg(`window: side ${i} support detected ${supDet.toFixed(0)} implied ${supImp.toFixed(0)}`);
+    return supDet < 20 || supImp >= 1.15 * supDet + 3;
+  });
+  if (swap.length !== bad.length) return; // mixed evidence: trust neither
+  const side = j => swap.includes(j) ? [implied[j], implied[(j + 1) % 4]] : [q[j], q[(j + 1) % 4]];
+  const q2 = [0, 1, 2, 3].map(j => { const A = side((j + 3) % 4), B = side(j); return lineX(A[0], A[1], B[0], B[1]); });
+  if (q2.some(p => !p || !isFinite(p.x) || !isFinite(p.y))) return;
+  // snap the replaced side onto the real (weak) edge if there is one within a few px
+  const r = refineQuadByGradient(luma, W, H, q2, 0, rgba, { hw: 3 });
+  const fixed = r && r.quad.every((p, j) => Math.hypot(p.x - q2[j].x, p.y - q2[j].y) < tol) ? r.quad : q2;
+  const g2 = quadRatio(fixed, expected);
+  best.quad = fixed; best.inner = win.quad; best.ratio = g2.ratio; best.rotated = g2.rotated; best.mode += '+fixed';
+}
+
+// No usable outer edge: find the photo window (a quad with the picture's aspect ratio) and
+// extend it by the border geometry. The chin side is chosen by edge evidence at the implied
+// outer edge, defaulting to chin-at-bottom when there is none (black frame on black table).
+function findViaWindow(luma, rgba, W, H, reg, expected, fr, seed, scratch, dbg) {
+  if (!rgba) return null;
+  const innerRatio = expected * (1 - fr.l - fr.r) / (1 - fr.t - fr.b);
+  const cands = [];
+  const sil = tableColour(rgba, W, reg);
+  if (sil) cands.push(findRing(luma, W, reg, sil.thr, innerRatio, scratch, 2, sil, rgba));
+  cands.push(findByEdges(luma, rgba, W, H, reg, innerRatio, seed, null));
+  let best = null;
+  for (const c of cands) {
+    if (!c) continue;
+    const gi = quadRatio(c.quad, innerRatio), go = quadRatio(c.quad, expected);
+    if (gi.err >= go.err) continue; // shaped like a whole print, not a window
+    const ks = Math.abs(innerRatio - 1) > 0.08 ? (gi.rotated ? [1, 3] : [0, 2]) : [0, 1, 2, 3];
+    let pick = null;
+    for (const k of ks) {
+      const O = outerFromWindow(c.quad, orientFr(fr, k));
+      if (O.some(p => p.x < -0.03 * W || p.y < -0.03 * H || p.x > 1.03 * W || p.y > 1.03 * H)) continue;
+      let sup = 0;
+      for (let i = 0; i < 4; i++) sup += lineSupport(rgba, W, H, O[i], O[(i + 1) % 4]) / 4;
+      const v = sup + (k === 0 ? 6 : 0);
+      if (!pick || v > pick.v) pick = { O, v, k, sup };
+    }
+    if (!pick) continue;
+    const r = refineQuadByGradient(luma, W, H, pick.O, 0, rgba, { hw: 3 });
+    const quad = r && r.inliers > 0.7 ? r.quad : pick.O;
+    const g = quadRatio(quad, expected);
+    const score = c.score + 0.1;
+    if (dbg) dbg(`window cand ${c.mode} score ${c.score.toFixed(3)} chin k${pick.k} support ${pick.sup.toFixed(0)}`);
+    if (!best || score < best.score) best = { quad, score, thresh: -3, inliers: c.inliers, centerFill: -1, band: null, ratio: g.ratio, rotated: g.rotated, mode: 'window', inner: c.quad };
+  }
+  return best;
 }
 
 // Laplacian variance inside the quad (shrunk) — same scale as the luma passed in.

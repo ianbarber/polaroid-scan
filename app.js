@@ -148,16 +148,16 @@ class VisionClient {
       this.worker.postMessage({ ...msg, id }, transfer || []);
     });
   }
-  async detect(rgba, w, h, region, expectedRatio, lastThresh, seed) {
+  async detect(rgba, w, h, region, expectedRatio, lastThresh, seed, borders) {
     if (!this.inline) {
-      try { return await this._call({ type: 'detect', rgba: rgba.buffer, w, h, region, expectedRatio, lastThresh, seed }, [rgba.buffer]); }
+      try { return await this._call({ type: 'detect', rgba: rgba.buffer, w, h, region, expectedRatio, lastThresh, seed, borders }, [rgba.buffer]); }
       catch (e) {
         if (!this.inline) throw e;
         return null; // buffer was transferred before the worker died — skip this tick, next one runs inline
       }
     }
     const luma = V.rgbaToLuma(rgba, w * h);
-    return V.detectBorder(luma, w, h, { region, expectedRatio, lastThresh, seed, rgba, scratch: this._scratch });
+    return V.detectBorder(luma, w, h, { region, expectedRatio, lastThresh, seed, borders, rgba, scratch: this._scratch });
   }
   async fuse(frames, opts, onProgress) {
     if (!this.inline) {
@@ -358,7 +358,7 @@ async function runLiveDetection() {
     const region = { x: proc.width * 0.01, y: proc.height * 0.01, w: proc.width * 0.98, h: proc.height * 0.98 };
     const gr0 = computeGuideRect();
     const seed = { x: gr0.x * k, y: gr0.y * k, w: gr0.w * k, h: gr0.h * k };
-    const det = await vision.detect(img.data, proc.width, proc.height, region, currentFormat().outerRatio, lastThresh, seed);
+    const det = await vision.detect(img.data, proc.width, proc.height, region, currentFormat().outerRatio, lastThresh, seed, currentFormat().borderFrac);
     const t = performance.now();
     if (det) {
       detectedQuad = det.quad.map(p => ({ x: p.x / k, y: p.y / k }));
@@ -602,7 +602,7 @@ async function doCapture(liveQuad) {
     const bx0 = Math.min(...xs), bx1 = Math.max(...xs), by0 = Math.min(...ys), by1 = Math.max(...ys);
     const region = { x: bx0 - (bx1 - bx0) * 0.2, y: by0 - (by1 - by0) * 0.2, w: (bx1 - bx0) * 1.4, h: (by1 - by0) * 1.4 };
     let det = null;
-    if (autoDetectChk.checked && !manualQuad) det = await vision.detect(simg.data, DETECT_WIDTH, dh, region, currentFormat().outerRatio, lastThresh, region);
+    if (autoDetectChk.checked && !manualQuad) det = await vision.detect(simg.data, DETECT_WIDTH, dh, region, currentFormat().outerRatio, lastThresh, region, currentFormat().borderFrac);
     if (sess !== scanSession) return;
     let quad, sharp, approx = false;
     if (det) { quad = det.quad.map(p => ({ x: p.x / k, y: p.y / k })); sharp = det.sharp; }

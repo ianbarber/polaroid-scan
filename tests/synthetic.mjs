@@ -114,7 +114,8 @@ for (let k = 0; k < K; k++) {
   const ang = k / K * Math.PI * 2;
   const glare = [{ x: 960 + Math.cos(ang) * 260, y: 720 + Math.sin(ang) * 300, rx: 170 + rnd() * 80, ry: 140 + rnd() * 80, amp: 210 }];
   if (style === 'gold') { const a = rnd() * Math.PI; sheen = { lo: +(process.env.GOLD_LO || 0.45), hi: 1.2, dx: Math.cos(a), dy: Math.sin(a), ph: rnd() * 6.28 }; }
-  const f = renderFrame(corners, glare, table, 10, 0);
+  // FLIP=1: print upside down (chin at the top)
+  const f = renderFrame(process.env.FLIP ? [corners[2], corners[3], corners[0], corners[1]] : corners, glare, table, 10, 0);
   gtQuads.push(corners);
   if (k === 0) writePNG(outDir + '/frame0.png', f.data, f.w, f.h);
   // detection at 640-wide preview (like the app)
@@ -126,7 +127,9 @@ for (let k = 0; k < K; k++) {
     w: (base[1].x - base[0].x + 120) / ds.scale, h: (base[3].y - base[0].y + 120) / ds.scale,
   };
   if (process.env.SEEDOFF) { seed.x += +process.env.SEEDOFF * seed.w; seed.y += 0.5 * +process.env.SEEDOFF * seed.h; } // print not centred in the guide
-  const det = V.detectBorder(ds.luma, ds.w, ds.h, { region, expectedRatio: 88 / 107, rgba: ds.rgba, seed, debug: !!process.env.DBG });
+  // the app's Polaroid 600 format table (not this render's exact borders — real prints vary a little)
+  const fmtBorders = process.env.NOWIN ? null : { l: 4.5 / 88, r: 4.5 / 88, t: 6 / 107, b: 22 / 107 };
+  const det = V.detectBorder(ds.luma, ds.w, ds.h, { region, expectedRatio: 88 / 107, rgba: ds.rgba, seed, borders: fmtBorders, debug: !!process.env.DBG });
   const dt = Date.now() - td;
   if (!det) { detFail++; console.log(`frame ${k}: DETECT FAIL (${dt}ms)`); continue; }
   const q = det.quad.map(p => ({ x: p.x * ds.scale, y: p.y * ds.scale }));
