@@ -328,6 +328,15 @@ function computeGuideRect() {
 function videoToScreen(p, gr) { return { x: p.x / gr.s + gr.offX, y: p.y / gr.s + gr.offY }; }
 function screenToVideo(p, gr) { return { x: (p.x - gr.offX) * gr.s, y: (p.y - gr.offY) * gr.s }; }
 function quadFromRect(r) { return [{ x: r.x, y: r.y }, { x: r.x + r.w, y: r.y }, { x: r.x + r.w, y: r.y + r.h }, { x: r.x, y: r.y + r.h }]; }
+// A detection the photo window backed up (+win / +fixed / window) is trusted. For ~0.8s after one,
+// an unconfirmed detection far from it is more likely a mis-lock (glare, clutter) than the print
+// jumping, so it is ignored instead of making the outline leap.
+let lastConfirmed = null; // { quad (video px), t }
+const isConfirmed = det => /\+win|\+fixed|^window/.test(det.mode);
+function implausibleJump(det, quadVideo) {
+  if (!lastConfirmed || isConfirmed(det) || performance.now() - lastConfirmed.t > 800) return false;
+  return V.quadDrift(quadVideo, lastConfirmed.quad) > 0.15 * quadWidth(lastConfirmed.quad);
+}
 function quadWidth(q) { return (Math.hypot(q[1].x - q[0].x, q[1].y - q[0].y) + Math.hypot(q[2].x - q[3].x, q[2].y - q[3].y)) / 2; }
 
 // ---------------------------------------------------------------- live detection loop
@@ -358,10 +367,12 @@ async function runLiveDetection() {
     const region = { x: proc.width * 0.01, y: proc.height * 0.01, w: proc.width * 0.98, h: proc.height * 0.98 };
     const gr0 = computeGuideRect();
     const seed = { x: gr0.x * k, y: gr0.y * k, w: gr0.w * k, h: gr0.h * k };
-    const det = await vision.detect(img.data, proc.width, proc.height, region, currentFormat().outerRatio, lastThresh, seed, currentFormat().borderFrac);
+    let det = await vision.detect(img.data, proc.width, proc.height, region, currentFormat().outerRatio, lastThresh, seed, currentFormat().borderFrac);
     const t = performance.now();
+    if (det && implausibleJump(det, det.quad.map(p => ({ x: p.x / k, y: p.y / k })))) det = null;
     if (det) {
       detectedQuad = det.quad.map(p => ({ x: p.x / k, y: p.y / k }));
+      if (isConfirmed(det)) lastConfirmed = { quad: detectedQuad, t };
       detInfo = det; lastDetectAt = t; lastThresh = det.thresh; noDetectSince = 0;
       if (det.sharp > sharpRef) sharpRef = det.sharp; else sharpRef = sharpRef * 0.995 + det.sharp * 0.005;
     } else {
@@ -604,6 +615,7 @@ async function doCapture(liveQuad) {
     let det = null;
     if (autoDetectChk.checked && !manualQuad) det = await vision.detect(simg.data, DETECT_WIDTH, dh, region, currentFormat().outerRatio, lastThresh, region, currentFormat().borderFrac);
     if (sess !== scanSession) return;
+    if (det && implausibleJump(det, det.quad.map(p => ({ x: p.x / k / vk, y: p.y / k / vk })))) det = null;
     let quad, sharp, approx = false;
     if (det) { quad = det.quad.map(p => ({ x: p.x / k, y: p.y / k })); sharp = det.sharp; }
     else if (manualQuad || !autoDetectChk.checked) { quad = (manualQuad || quadFromRect(computeGuideRect())).map(p => ({ x: p.x * vk, y: p.y * vk })); sharp = V.sharpnessInQuad(luma, DETECT_WIDTH, dh, hintQuad); approx = true; }
@@ -635,7 +647,7 @@ async function doCapture(liveQuad) {
       const blob = await canvasToBlob(cap, 'image/jpeg', 0.9);
       if (blob) saveLocally(blob, debugFilename(`cap${String(frames.length).padStart(2, '0')}`), {
         kind: 'capture', frame: frames.length, sharp: Math.round(sharp), approx, photo: !!bmp, format: currentFormat().label,
-        quad: quad.map(p => [Math.round(p.x), Math.round(p.y)]), det: det ? { score: +det.score.toFixed(3), thresh: det.thresh, inliers: +det.inliers.toFixed(2), rotated: det.rotated } : null,
+        quad: quad.map(p => [Math.round(p.x), Math.round(p.y)]), det: det ? { mode: det.mode, score: +det.score.toFixed(3), thresh: det.thresh, inliers: +det.inliers.toFixed(2), rotated: det.rotated } : null,
         ts: new Date().toISOString(),
       });
     }

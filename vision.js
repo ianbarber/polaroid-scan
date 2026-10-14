@@ -203,8 +203,9 @@ export function detectBorder(luma, W, H, opts) {
   // (gold/silver foil) frames whose brightness swings with angle, coloured borders, etc.
   if (!best || best.score > 0.12) {
     const sil = opts.rgba && tableColour(opts.rgba, W, reg);
-    if (sil) consider(findRing(luma, W, reg, sil.thr, expected, scratch, 2, sil, opts.rgba));
-    if (dbg) dbg('after silhouette:', sil ? `bg ${sil.bg.map(Math.round)} thr ${sil.thr.toFixed(0)}` : 'no plain table', best ? `${best.mode} score ${best.score.toFixed(3)}` : 'none');
+    const sr = sil && findRing(luma, W, reg, sil.thr, expected, scratch, 2, sil, opts.rgba);
+    consider(sr);
+    if (dbg) dbg('after silhouette:', sil ? `bg ${sil.bg.map(Math.round)} thr ${sil.thr.toFixed(0)} own ${sr ? sr.score.toFixed(3) : 'none'}` : 'no plain table', best ? `${best.mode} score ${best.score.toFixed(3)}` : 'none');
   }
   if (!best || best.score > 0.2) {
     consider(findByEdges(luma, opts.rgba, W, H, reg, expected, opts.seed, dbg));
@@ -250,23 +251,41 @@ export function glareStats(luma, W, H, quad) {
   return { frac: on / n, u, v };
 }
 
-// Table colour = median RGB of a thin band around the region's perimeter, if that band is plain
-// enough (most of it close to the median). Returns { bg, thr } or null.
+// Colour distance from the table colour that mostly ignores shading: the chroma part (difference
+// after removing the mean brightness shift) counts fully, the brightness shift itself counts once —
+// so a lighting gradient across a wood table stays "table" while a green or gold border does not.
+function tableDist(r, g, b, bg) {
+  const dr = r - bg[0], dg = g - bg[1], db = b - bg[2], dl = (dr + dg + db) / 3;
+  return Math.abs(dr - dl) + Math.abs(dg - dl) + Math.abs(db - dl) + Math.abs(dl);
+}
+
+// Table colour = the dominant colour cluster in a thin band around the region's perimeter. Other
+// things at the frame edge (a chair, another print, a rug) are ignored as long as the table is
+// at least ~30% of the perimeter. Returns { bg, thr } or null.
 function tableColour(rgba, W, reg) {
   const m = Math.max(2, Math.round(Math.min(reg.w, reg.h) * 0.03));
-  const rs = [], gs = [], bs = [];
-  const push = (x, y) => { const i = (y * W + x) * 4; rs.push(rgba[i]); gs.push(rgba[i + 1]); bs.push(rgba[i + 2]); };
+  const px = [];
+  const push = (x, y) => { const i = (y * W + x) * 4; px.push([rgba[i], rgba[i + 1], rgba[i + 2]]); };
   const sx = Math.max(1, Math.round(reg.w / 120)), sy = Math.max(1, Math.round(reg.h / 120));
   for (let d = 0; d < m; d += 2) {
     for (let x = reg.x; x < reg.x + reg.w; x += sx) { push(x, reg.y + d); push(x, reg.y + reg.h - 1 - d); }
     for (let y = reg.y; y < reg.y + reg.h; y += sy) { push(reg.x + d, y); push(reg.x + reg.w - 1 - d, y); }
   }
+  // fullest coarse colour bin seeds the cluster
+  const bins = new Map();
+  for (const p of px) { const k = (p[0] >> 5) << 6 | (p[1] >> 5) << 3 | (p[2] >> 5); bins.set(k, (bins.get(k) || 0) + 1); }
+  let topK = 0, topN = -1;
+  for (const [k, n] of bins) if (n > topN) { topN = n; topK = k; }
+  let bg = [((topK >> 6) & 7) * 32 + 16, ((topK >> 3) & 7) * 32 + 16, (topK & 7) * 32 + 16];
   const med = a => a.slice().sort((p, q) => p - q)[a.length >> 1];
-  const bg = [med(rs), med(gs), med(bs)];
-  const dist = rs.map((r, i) => Math.abs(r - bg[0]) + Math.abs(gs[i] - bg[1]) + Math.abs(bs[i] - bg[2])).sort((p, q) => p - q);
-  const d50 = dist[dist.length >> 1], d80 = dist[Math.floor(dist.length * 0.8)];
-  if (d80 > 60) return null; // busy/patterned surface, or the print fills the frame
-  return { bg, thr: Math.max(30, 2.5 * d80, 5 * d50) };
+  let cl = px;
+  for (let it = 0; it < 3; it++) { // gather the cluster around the seed, re-centre on its median
+    cl = px.filter(p => tableDist(p[0], p[1], p[2], bg) < 45);
+    if (cl.length < 0.3 * px.length) return null; // no dominant plain surface
+    bg = [med(cl.map(p => p[0])), med(cl.map(p => p[1])), med(cl.map(p => p[2]))];
+  }
+  const d = cl.map(p => tableDist(p[0], p[1], p[2], bg)).sort((p, q) => p - q);
+  return { bg, thr: Math.max(30, 3 * d[d.length >> 1], 1.5 * d[Math.floor(d.length * 0.9)]) };
 }
 
 // pol: 1 = bright ring (white border), -1 = dark ring (black frame),
@@ -280,10 +299,9 @@ function findRing(luma, W, reg, t, expected, scratch, pol, sil = null, rgba = nu
   for (let y = 0; y < rh; y++) {
     const row = (reg.y + y) * W + reg.x, o = y * rw;
     if (pol === 2) {
-      const [br, bgc, bb] = sil.bg;
       for (let x = 0; x < rw; x++) {
         const i = (row + x) * 4;
-        mask[o + x] = Math.abs(rgba[i] - br) + Math.abs(rgba[i + 1] - bgc) + Math.abs(rgba[i + 2] - bb) > t ? 1 : 0;
+        mask[o + x] = tableDist(rgba[i], rgba[i + 1], rgba[i + 2], sil.bg) > t ? 1 : 0;
       }
     } else for (let x = 0; x < rw; x++) mask[o + x] = (pol > 0 ? luma[row + x] > t : luma[row + x] < t) ? 1 : 0;
   }
@@ -626,7 +644,7 @@ function silBandCheck(rgba, W, H, q, sil) {
   const size = Math.min(Math.hypot(q[1].x - q[0].x, q[1].y - q[0].y), Math.hypot(q[3].x - q[0].x, q[3].y - q[0].y));
   const off = Math.max(2.5, Math.min(8, size * 0.02));
   const px3 = [0, 0, 0];
-  const dist = (x, y) => { sampleRGB(rgba, W, H, x, y, px3); return Math.abs(px3[0] - sil.bg[0]) + Math.abs(px3[1] - sil.bg[1]) + Math.abs(px3[2] - sil.bg[2]); };
+  const dist = (x, y) => { sampleRGB(rgba, W, H, x, y, px3); return tableDist(px3[0], px3[1], px3[2], sil.bg); };
   let on = 0, tot = 0, inSum = 0, outSum = 0;
   for (let i = 0; i < 4; i++) {
     const p0 = q[i], p1 = q[(i + 1) % 4];
@@ -815,8 +833,8 @@ function checkWithWindow(luma, rgba, W, H, best, fr, expected, dbg) {
   const bad = [0, 1, 2, 3].filter(i => gaps[i] > tol);
   const strong = win.inliers >= 0.8 && win.spread <= 1.2;
   if (dbg) dbg(`window k${win.k} inl ${win.inliers.toFixed(2)} spread ${win.spread.toFixed(2)} gaps ${gaps.map(v => v.toFixed(1)).join(' ')} tol ${tol.toFixed(1)}`);
-  if (!bad.length) { best.inner = win.quad; best.score = Math.max(0, best.score - 0.05); best.mode += '+win'; return; }
-  if (!strong) return;
+  if (!bad.length && win.inliers >= 0.75 && win.spread <= 2) { best.inner = win.quad; best.score = Math.max(0, best.score - 0.05); best.mode += '+win'; return; }
+  if (!bad.length || !strong) return;
   // replace a disagreeing side only where the detected line is not on a clearly real edge — so a
   // wrong format choice (every detected side crisp, implied ones off-edge) never moves anything
   const swap = bad.filter(i => {
