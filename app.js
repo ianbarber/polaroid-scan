@@ -669,6 +669,9 @@ async function doCapture(liveQuad) {
     }
     if (sess !== scanSession) return;
     if (det && implausibleJump(det, det.quad.map(p => ({ x: p.x / k / vk, y: p.y / k / vk })))) det = null;
+    // once the scan has a window-confirmed frame, an unconfirmed border fit on a capture is more
+    // likely skewed (e.g. pulled by a pen touching the print) than right — and a skewed frame ghosts
+    if (det && !isConfirmed(det) && frames.some(f => f.confirmed)) { skipReason = 'unconfirmed border'; return; }
     let quad, sharp, approx = false;
     if (det) { quad = det.quad.map(p => ({ x: p.x / k, y: p.y / k })); sharp = det.sharp; }
     else if (manualQuad || !autoDetectChk.checked) { quad = (manualQuad || quadFromRect(computeGuideRect())).map(p => ({ x: p.x * vk, y: p.y * vk })); sharp = V.sharpnessInQuad(luma, DETECT_WIDTH, dh, hintQuad); approx = true; }
@@ -686,7 +689,7 @@ async function doCapture(liveQuad) {
       data: img.data, w: img.width, h: img.height,
       quad: quad.map(p => ({ x: p.x - x0, y: p.y - y0 })),
       videoQuad: quad.map(p => ({ x: p.x / vk, y: p.y / vk })),
-      sharp, approx, ts: Date.now(),
+      sharp, approx, ts: Date.now(), confirmed: !!(det && isConfirmed(det)),
     };
     frames.push(frame);
     if (det && det.glare) glareTrail.push(det.glare);

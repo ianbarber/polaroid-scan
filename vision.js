@@ -1499,8 +1499,12 @@ export function fusePipeline(framesIn, opts) {
   // 2. drop frames that could not be aligned confidently
   if (frames.length >= 3) {
     const keepIdx = [];
+    // absolute floor, plus relative: a frame clearly worse than the rest of this scan is usually a
+    // bad border fit that alignment couldn't fully undo, and it ghosts fine detail (small text)
+    const confs = diag.map(d => d.conf).sort((a, b) => a - b), medConf = confs[confs.length >> 1];
+    const minConf = Math.max(0.4, medConf - 0.12);
     for (let k = 0; k < frames.length; k++) {
-      if (diag[k].cells >= 3 && diag[k].conf >= 0.4) keepIdx.push(k);
+      if (diag[k].cells >= 3 && diag[k].conf >= minConf) keepIdx.push(k);
       else dropped.push({ idx: frames[k].idx, why: `alignment conf ${diag[k].conf.toFixed(2)}` });
     }
     if (keepIdx.length >= 2 && keepIdx.length < frames.length) {
