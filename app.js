@@ -174,8 +174,8 @@ class VisionClient {
     const s = this._session; if (!s) throw new Error('nothing to re-fuse');
     const used = s.res.used.map(i => s.frames[i]);
     const o = { ...s.opts, ...opts };
-    const fused = V.fuseAligned(used, s.res.Hs, s.res.gains, s.opts.outW, s.opts.outH, { glarePct: o.glarePct, onProgress: f => onProgress && onProgress('fuse', f) });
-    return V.finishPipeline(fused, { ...o, Hs: s.res.Hs, gains: s.res.gains, diag: s.res.diag, dropped: s.res.dropped, used: s.res.used });
+    const fused = V.fuseAligned(used, s.res.Hs, s.res.gains, s.opts.outW, s.opts.outH, { glarePct: o.glarePct, haze: s.res.haze, onProgress: f => onProgress && onProgress('fuse', f) });
+    return V.finishPipeline(fused, { ...o, Hs: s.res.Hs, gains: s.res.gains, haze: s.res.haze, diag: s.res.diag, dropped: s.res.dropped, used: s.res.used });
   }
   // Free the retained fusion inputs (frames can be 50-100 MB on hi-res scans).
   reset() {
@@ -328,14 +328,20 @@ function computeGuideRect() {
 function videoToScreen(p, gr) { return { x: p.x / gr.s + gr.offX, y: p.y / gr.s + gr.offY }; }
 function screenToVideo(p, gr) { return { x: (p.x - gr.offX) * gr.s, y: (p.y - gr.offY) * gr.s }; }
 function quadFromRect(r) { return [{ x: r.x, y: r.y }, { x: r.x + r.w, y: r.y }, { x: r.x + r.w, y: r.y + r.h }, { x: r.x, y: r.y + r.h }]; }
-// A detection the photo window backed up (+win / +fixed / window) is trusted. For ~0.8s after one,
-// an unconfirmed detection far from it is more likely a mis-lock (glare, clutter) than the print
-// jumping, so it is ignored instead of making the outline leap.
+// A detection the photo window backed up (+win / +fixed / window) is trusted. Right after one, a
+// single unconfirmed detection far from it is more likely a mis-lock (glare, clutter) than the print
+// jumping, so it is ignored. But the phone really does move fast when the user swings it to shift
+// the reflection — so only one-off outliers are dropped: a second far-off result in a row is
+// accepted, and the allowed distance grows with the time since the confirmed quad.
 let lastConfirmed = null; // { quad (video px), t }
+let jumpRejects = 0;
 const isConfirmed = det => /\+win|\+fixed|^window/.test(det.mode);
 function implausibleJump(det, quadVideo) {
-  if (!lastConfirmed || isConfirmed(det) || performance.now() - lastConfirmed.t > 800) return false;
-  return V.quadDrift(quadVideo, lastConfirmed.quad) > 0.15 * quadWidth(lastConfirmed.quad);
+  const dt = lastConfirmed ? performance.now() - lastConfirmed.t : 1e9;
+  if (isConfirmed(det) || dt > 600 || jumpRejects >= 1) { jumpRejects = 0; return false; }
+  const far = V.quadDrift(quadVideo, lastConfirmed.quad) > quadWidth(lastConfirmed.quad) * (0.2 + 0.6 * dt / 1000);
+  if (far) jumpRejects++; else jumpRejects = 0;
+  return far;
 }
 function quadWidth(q) { return (Math.hypot(q[1].x - q[0].x, q[1].y - q[0].y) + Math.hypot(q[2].x - q[3].x, q[2].y - q[3].y)) / 2; }
 
@@ -380,13 +386,14 @@ async function runLiveDetection() {
       if (!noDetectSince) noDetectSince = t;
     }
     if (debugChk.checked) {
-      $('#statFrames').textContent = `${frames.length} frames`;
+      $('#statFrames').textContent = `${frames.length} frames${capturing && skipReason ? ` · skip: ${skipReason}` : ''}`;
       $('#statSharp').textContent = det ? `sharp ${Math.round(det.sharp)} / ref ${Math.round(sharpRef)}` : 'sharp —';
       $('#statGlare').textContent = det ? `bright ${(det.brightFrac * 100).toFixed(1)}%` : 'bright —';
       $('#statDrift').textContent = det ? `${det.mode} ${det.score.toFixed(2)}${det.rotated ? ' rot' : ''}` : 'no border';
     }
     updateStatus();
     if (capturing && det) maybeAutoCapture(det);
+    if (capturing && debugEnabled() && (!det || (skipReason && skipReason !== 'not moved')) && t - lastLostSave > 1500) saveLostFrame(det ? `skip: ${skipReason}` : 'no border');
   } catch (e) { console.warn('detect failed', e); }
   finally { detectPending = false; }
 }
@@ -557,25 +564,39 @@ function cancelFusion() {
   setStatus('Processing cancelled', 'warn', 3000);
 }
 
+// Debug: while scanning, save the preview frame (rate-limited) when the border is lost or a capture
+// is being skipped, so failures that never become captures can still be inspected in /debug/.
+let lastLostSave = 0;
+async function saveLostFrame(reason) {
+  lastLostSave = performance.now();
+  const c = document.createElement('canvas'); c.width = video.videoWidth; c.height = video.videoHeight;
+  c.getContext('2d').drawImage(video, 0, 0);
+  const blob = await canvasToBlob(c, 'image/jpeg', 0.88);
+  if (blob) saveLocally(blob, debugFilename('lost'), { kind: 'lost', reason, frames: frames.length, liveQuad: detectedQuad ? detectedQuad.map(p => [Math.round(p.x), Math.round(p.y)]) : null, mode: detInfo ? detInfo.mode : null, ts: new Date().toISOString() });
+}
+
 // Gate auto-capture on a fresh live detection: sharp enough, not blown out, moved since the last frames.
+let skipReason = '';
 function maybeAutoCapture(det) {
   if (!capturing || captureBusy) return;
   const now = performance.now();
   if (now - lastCap < 280) return;
-  if (det.sharp < 0.5 * sharpRef) return;
-  if (det.brightFrac > 0.3) return;
+  if (det.sharp < 0.5 * sharpRef) { skipReason = 'blurry'; return; }
+  if (det.brightFrac > 0.3) { skipReason = 'glare'; return; }
   const q = detectedQuad;
   if (frames.length) {
-    if (det.rotated !== scanRotated) return;
+    if (det.rotated !== scanRotated) { skipReason = 'rotated'; return; }
     const area = V.quadArea(q);
-    if (Math.abs(area / firstArea - 1) > 0.2) return;
+    // phone raised/lowered or tilted to move the reflection changes the print's size in view
+    if (Math.abs(area / firstArea - 1) > 0.35) { skipReason = `size ${Math.round(area / firstArea * 100)}%`; return; }
     // require the print to have moved in the image (= viewpoint changed = reflections moved)
     const qw = quadWidth(q);
     const need = qw * Math.min(0.04, 0.012 + 0.003 * frames.length);
     let minDrift = 1e9;
     for (const f of frames) minDrift = Math.min(minDrift, V.quadDrift(q, f.videoQuad));
-    if (minDrift < need) return;
+    if (minDrift < need) { skipReason = 'not moved'; return; }
   }
+  skipReason = '';
   doCapture(q);
 }
 
@@ -613,7 +634,16 @@ async function doCapture(liveQuad) {
     const bx0 = Math.min(...xs), bx1 = Math.max(...xs), by0 = Math.min(...ys), by1 = Math.max(...ys);
     const region = { x: bx0 - (bx1 - bx0) * 0.2, y: by0 - (by1 - by0) * 0.2, w: (bx1 - bx0) * 1.4, h: (by1 - by0) * 1.4 };
     let det = null;
-    if (autoDetectChk.checked && !manualQuad) det = await vision.detect(simg.data, DETECT_WIDTH, dh, region, currentFormat().outerRatio, lastThresh, region, currentFormat().borderFrac);
+    if (autoDetectChk.checked && !manualQuad) {
+      // detect() transfers the pixel buffer to the worker, so keep a copy for a full-frame retry —
+      // the print may have moved out of the hint region between the live detection and the photo
+      const copy = new Uint8ClampedArray(simg.data);
+      det = await vision.detect(simg.data, DETECT_WIDTH, dh, region, currentFormat().outerRatio, lastThresh, region, currentFormat().borderFrac);
+      if (!det && sess === scanSession) {
+        const full = { x: DETECT_WIDTH * 0.01, y: dh * 0.01, w: DETECT_WIDTH * 0.98, h: dh * 0.98 };
+        det = await vision.detect(copy, DETECT_WIDTH, dh, full, currentFormat().outerRatio, lastThresh, region, currentFormat().borderFrac);
+      }
+    }
     if (sess !== scanSession) return;
     if (det && implausibleJump(det, det.quad.map(p => ({ x: p.x / k / vk, y: p.y / k / vk })))) det = null;
     let quad, sharp, approx = false;
@@ -738,7 +768,7 @@ function showResult(res) {
   $('#diagText').textContent = debugEnabled() ? `${diag}${res.timing ? ` · align ${Math.round(res.timing.align)}ms fuse ${Math.round(res.timing.fuse)}ms` : ''}` : '';
   if (debugEnabled()) {
     canvasToBlob(full, 'image/jpeg', 0.93).then(blob => blob && saveLocally(blob, debugFilename('fused'), {
-      kind: 'fused', w: res.w, h: res.h, N: res.N, used: res.used, dropped: res.dropped, diag: res.diag, timing: res.timing, crop: res.crop,
+      kind: 'fused', w: res.w, h: res.h, N: res.N, used: res.used, dropped: res.dropped, diag: res.diag, timing: res.timing, hazeInfo: res.hazeInfo, crop: res.crop,
       format: currentFormat().label, glareDiscard: glareRange.value, ms: res.ms,
     }));
   }

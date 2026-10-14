@@ -152,7 +152,8 @@ if (frames.length < 2) { console.log('fewer than 2 frames detected — skipping 
 const outW = 1809, outH = 2200;
 const borders = { l: 45 / 880, r: 45 / 880, t: 55 / 1070, b: 225 / 1070 };
 const t1 = Date.now();
-const res = V.fusePipeline(frames, { outW, outH, glarePct: 65, borders, autoCrop: false, sharpen: 0, onProgress: () => { } });
+const res = V.fusePipeline(frames, { outW, outH, glarePct: 65, borders, autoCrop: false, sharpen: 0, dehaze: !process.env.NODEHAZE, onProgress: () => { } });
+console.log('haze', JSON.stringify(res.hazeInfo));
 console.log(`fuse pipeline: ${Date.now() - t1}ms  (align ${res.timing.align.toFixed(0)}ms fuse ${res.timing.fuse.toFixed(0)}ms)`);
 for (let k = 0; k < frames.length; k++) console.log(`  frame ${k}: align shift ${res.diag[k].shift.toFixed(2)}px conf ${res.diag[k].conf.toFixed(2)} cells ${res.diag[k].cells} gains ${res.gains[k].map(g => g.toFixed(3)).join(',')}`);
 writePNG(outDir + '/fused.png', res.data, res.w, res.h);

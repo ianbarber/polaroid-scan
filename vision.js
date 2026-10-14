@@ -1146,6 +1146,146 @@ export function estimateGains(frames, Hs, outW, outH) {
 // ---------------------------------------------------------------- fusion
 
 // Robust per-pixel fusion. glarePct 0..100 — how aggressively bright samples are rejected.
+// ---------------------------------------------------------------- reflection haze
+// A glossy print reflects the bright room as a faint smooth veil ("haze"). Where the phone's own
+// dark reflection blocks it, the true colours show — and since circling with the phone level
+// carries that reflection along with the camera, it sits over the same part of the print in most
+// frames, so per-pixel fusion keeps a phone-shaped patch of deeper colour inside hazy surroundings.
+// Fix: in the shaded patches the frame shows the truth; other frames at those spots show truth +
+// haze. Measure each frame's haze there, extend it smoothly over the whole print (room reflections
+// vary slowly), and subtract it before fusing. Works at ~226 px wide; null if there's no shading.
+function blurBox(a, w, h, ch, r) {
+  if (r < 1) return;
+  const tmp = new Float32Array(Math.max(w, h) * ch), win = 2 * r + 1;
+  for (let pass = 0; pass < 3; pass++) {
+    for (let y = 0; y < h; y++) { // horizontal
+      const row = y * w * ch;
+      for (let c = 0; c < ch; c++) {
+        let acc = 0;
+        for (let i = -r - 1; i < r; i++) acc += a[row + Math.min(w - 1, Math.max(0, i)) * ch + c];
+        for (let x = 0; x < w; x++) {
+          acc += a[row + Math.min(w - 1, x + r) * ch + c] - a[row + Math.max(0, x - r - 1) * ch + c];
+          tmp[x * ch + c] = acc / win;
+        }
+      }
+      a.set(tmp.subarray(0, w * ch), row);
+    }
+    for (let x = 0; x < w; x++) { // vertical
+      for (let c = 0; c < ch; c++) {
+        let acc = 0;
+        for (let i = -r - 1; i < r; i++) acc += a[(Math.min(h - 1, Math.max(0, i)) * w + x) * ch + c];
+        for (let y = 0; y < h; y++) {
+          acc += a[(Math.min(h - 1, y + r) * w + x) * ch + c] - a[(Math.max(0, y - r - 1) * w + x) * ch + c];
+          tmp[y * ch + c] = acc / win;
+        }
+        for (let y = 0; y < h; y++) a[(y * w + x) * ch + c] = tmp[y * ch + c];
+      }
+    }
+  }
+}
+const gaussR = sig => Math.max(1, Math.round(sig * 0.9)); // 3 box passes of radius r ≈ gaussian σ
+
+export function estimateHaze(frames, Hs, gains, outW, outH) {
+  const K = frames.length;
+  if (K < 3) return null;
+  const S = Math.max(2, Math.round(outW / 226));
+  const w = Math.ceil(outW / S), h = Math.ceil(outH / S), n = w * h, sc = w / 452; // tuned at 452 px wide
+  const I = [], Vd = [], L = [];
+  for (let k = 0; k < K; k++) {
+    const b = new Float32Array(n * 3), v = new Uint8Array(n), l = new Float32Array(n);
+    warpPatch(frames[k], Hs[k], 0, 0, w, h, S, b, v);
+    const g = gains ? gains[k] : [1, 1, 1];
+    for (let p = 0; p < n; p++) {
+      b[p * 3] *= g[0]; b[p * 3 + 1] *= g[1]; b[p * 3 + 2] *= g[2];
+      l[p] = 0.299 * b[p * 3] + 0.587 * b[p * 3 + 1] + 0.114 * b[p * 3 + 2];
+    }
+    I.push(b); Vd.push(v); L.push(l);
+  }
+  // reference = brightest sample per pixel that isn't glare (glare = far above the median)
+  const M = new Float32Array(n), vals = [];
+  let nValid = 0, darkA = 0, brightA = 0;
+  for (let p = 0; p < n; p++) {
+    vals.length = 0;
+    for (let k = 0; k < K; k++) if (Vd[k][p]) vals.push(L[k][p]);
+    if (vals.length < 3) { M[p] = -1; continue; }
+    nValid++;
+    vals.sort((a, b) => a - b);
+    const med = vals[vals.length >> 1], lim = med + 25 + 0.1 * med;
+    let m = med; for (const x of vals) if (x <= lim) m = x;
+    M[p] = m;
+    darkA += Math.max(0, med - vals[0] - 10); brightA += Math.max(0, vals[vals.length - 1] - med - 10);
+  }
+  if (!nValid) return null;
+  darkA /= nValid; brightA /= nValid;
+  // Only when frames mostly differ by DARK patches (the phone blocking a veil) rather than bright
+  // ones (specular glare, whose soft tails would otherwise be mistaken for haze and over-subtracted).
+  if (darkA < 1 || darkA <= brightA) return null;
+  const okAt = (k, p) => Vd[k][p] && M[p] >= 0 && L[k][p] <= M[p];
+  // shaded = clearly darker than the reference, as a smooth blob
+  const sh = [], anysh = new Uint8Array(n);
+  let nAny = 0;
+  for (let k = 0; k < K; k++) {
+    const D = new Float32Array(n);
+    for (let p = 0; p < n; p++) D[p] = okAt(k, p) ? M[p] - L[k][p] : 0;
+    blurBox(D, w, h, 1, gaussR(3 * sc));
+    const s = new Uint8Array(n);
+    for (let p = 0; p < n; p++) if (D[p] > 14 && okAt(k, p)) { s[p] = 1; if (!anysh[p]) { anysh[p] = 1; nAny++; } }
+    sh.push(s);
+  }
+  if (nAny < 0.03 * nValid) return null;
+  // truth where shaded = mean of the shaded samples
+  const T = new Float32Array(n * 3), cnt = new Uint8Array(n);
+  for (let k = 0; k < K; k++) for (let p = 0; p < n; p++) if (sh[k][p]) {
+    T[p * 3] += I[k][p * 3]; T[p * 3 + 1] += I[k][p * 3 + 1]; T[p * 3 + 2] += I[k][p * 3 + 2]; cnt[p]++;
+  }
+  for (let p = 0; p < n; p++) if (cnt[p]) { T[p * 3] /= cnt[p]; T[p * 3 + 1] /= cnt[p]; T[p * 3 + 2] /= cnt[p]; }
+  const haze = [];
+  let hazeSum = 0;
+  const r1 = gaussR(25 * sc), r2 = gaussR(120 * sc);
+  for (let k = 0; k < K; k++) {
+    // haze samples: spots shaded in some other frame but not this one
+    const num1 = new Float32Array(n * 3), den1 = new Float32Array(n);
+    let nw = 0;
+    for (let p = 0; p < n; p++) {
+      if (!anysh[p] || sh[k][p] || !okAt(k, p)) continue;
+      num1[p * 3] = I[k][p * 3] - T[p * 3]; num1[p * 3 + 1] = I[k][p * 3 + 1] - T[p * 3 + 1]; num1[p * 3 + 2] = I[k][p * 3 + 2] - T[p * 3 + 2];
+      den1[p] = 1; nw++;
+    }
+    if (nw < 0.02 * nValid) { haze.push(null); continue; }
+    const num2 = num1.slice(), den2 = den1.slice();
+    blurBox(num1, w, h, 3, r1); blurBox(den1, w, h, 1, r1);
+    blurBox(num2, w, h, 3, r2); blurBox(den2, w, h, 1, r2);
+    const soft = new Float32Array(n);
+    for (let p = 0; p < n; p++) soft[p] = sh[k][p];
+    blurBox(soft, w, h, 1, gaussR(2 * sc));
+    const hk = new Float32Array(n * 3);
+    for (let p = 0; p < n; p++) {
+      const t = Math.min(1, den1[p] / 0.3), keep = 1 - Math.min(1, soft[p]);
+      for (let c = 0; c < 3; c++) {
+        const a = den1[p] > 1e-6 ? num1[p * 3 + c] / den1[p] : 0, b = den2[p] > 1e-6 ? num2[p * 3 + c] / den2[p] : 0;
+        hk[p * 3 + c] = Math.min(60, Math.max(0, t * a + (1 - t) * b)) * keep; // haze only adds light
+      }
+      hazeSum += (hk[p * 3] + hk[p * 3 + 1] + hk[p * 3 + 2]) / 3;
+    }
+    haze.push(hk);
+  }
+  return { w, h, S, haze, info: { shadedFrac: +(nAny / nValid).toFixed(3), meanHaze: +(hazeSum / (n * K)).toFixed(1) } };
+}
+
+function subtractHaze(buf, outW, bh, y0, hz, hk) {
+  const { w, h, S } = hz;
+  for (let j = 0; j < bh; j++) {
+    const v = Math.min(h - 1.001, Math.max(0, (y0 + j + 0.5) / S - 0.5)), iy = Math.floor(v), fy = v - iy;
+    for (let i = 0; i < outW; i++) {
+      const u = Math.min(w - 1.001, Math.max(0, (i + 0.5) / S - 0.5)), ix = Math.floor(u), fx = u - ix;
+      const a = (iy * w + ix) * 3, b = a + w * 3, o = (j * outW + i) * 3;
+      for (let c = 0; c < 3; c++) {
+        buf[o + c] -= (hk[a + c] * (1 - fx) + hk[a + 3 + c] * fx) * (1 - fy) + (hk[b + c] * (1 - fx) + hk[b + 3 + c] * fx) * fy;
+      }
+    }
+  }
+}
+
 export function fuseAligned(frames, Hs, gains, outW, outH, opts = {}) {
   const K = frames.length;
   const glarePct = opts.glarePct == null ? 65 : opts.glarePct;
@@ -1165,6 +1305,7 @@ export function fuseAligned(frames, Hs, gains, outW, outH, opts = {}) {
         const b = bufs[k];
         for (let p = 0, e = outW * bh * 3; p < e; p += 3) { b[p] *= g[0]; b[p + 1] *= g[1]; b[p + 2] *= g[2]; }
       }
+      if (opts.haze && opts.haze.haze[k]) subtractHaze(bufs[k], outW, bh, y0, opts.haze, opts.haze.haze[k]);
     }
     for (let j = 0; j < bh; j++) {
       let lastR = 235, lastG = 235, lastB = 235; // fill for uncovered pixels: smear along the row
@@ -1281,7 +1422,7 @@ export function fusePipeline(framesIn, opts) {
   if (frames.length >= 3) {
     const areas = frames.map(f => quadArea(f.quad)).sort((a, b) => a - b);
     const med = areas[areas.length >> 1];
-    const keep = frames.filter(f => Math.abs(quadArea(f.quad) / med - 1) < 0.2);
+    const keep = frames.filter(f => Math.abs(quadArea(f.quad) / med - 1) < 0.35); // matches the app's capture gate
     if (keep.length >= 2) { for (const f of frames) if (!keep.includes(f)) dropped.push({ idx: f.idx, why: 'border size outlier' }); frames = keep; }
   }
   const dstQ = rectQuad(outW, outH);
@@ -1306,9 +1447,10 @@ export function fusePipeline(framesIn, opts) {
   const gains = estimateGains(frames, Hs, outW, outH);
   prog('fuse', 0);
   const t1 = now();
-  const fused = fuseAligned(frames, Hs, gains, outW, outH, { glarePct: opts.glarePct, onProgress: f => prog('fuse', f) });
+  const haze = opts.dehaze === false ? null : estimateHaze(frames, Hs, gains, outW, outH);
+  const fused = fuseAligned(frames, Hs, gains, outW, outH, { glarePct: opts.glarePct, haze, onProgress: f => prog('fuse', f) });
   const tFuse = now() - t1;
-  return finishPipeline(fused, { ...opts, Hs, gains, diag, dropped, used: frames.map(f => f.idx), timing: { align: tAlign, fuse: tFuse } });
+  return finishPipeline(fused, { ...opts, Hs, gains, haze, diag, dropped, used: frames.map(f => f.idx), timing: { align: tAlign, fuse: tFuse } });
 }
 
 // Rotate RGBA by 90° clockwise (dir=1) or counter-clockwise (dir=-1).
@@ -1364,7 +1506,7 @@ export function finishPipeline(fused, opts) {
   // rect so the UI can offer frame/no-frame instantly without re-processing.
   if (opts.borders) crop = refineInnerCrop(fused.data, fused.w, fused.h, opts.borders);
   if (opts.sharpen) img = { data: unsharp(img.data, img.w, img.h, opts.sharpen), w: img.w, h: img.h };
-  return { data: img.data, w: img.w, h: img.h, crop, Hs: opts.Hs, gains: opts.gains, diag: opts.diag, dropped: opts.dropped || [], used: opts.used, timing: opts.timing };
+  return { data: img.data, w: img.w, h: img.h, crop, Hs: opts.Hs, gains: opts.gains, haze: opts.haze || null, hazeInfo: opts.haze ? opts.haze.info : null, diag: opts.diag, dropped: opts.dropped || [], used: opts.used, timing: opts.timing };
 }
 
 function now() { return (typeof performance !== 'undefined' ? performance.now() : Date.now()); }
