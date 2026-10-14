@@ -1280,7 +1280,7 @@ export function estimateHaze(frames, Hs, gains, outW, outH) {
   for (let p = 0; p < n; p++) if (cnt[p]) { T[p * 3] /= cnt[p]; T[p * 3 + 1] /= cnt[p]; T[p * 3 + 2] /= cnt[p]; }
   const haze = [];
   let hazeSum = 0;
-  const r1 = gaussR(25 * sc), r2 = gaussR(120 * sc);
+  const r1 = gaussR(25 * sc);
   for (let k = 0; k < K; k++) {
     // haze samples: spots shaded in some other frame but not this one
     const num1 = new Float32Array(n * 3), den1 = new Float32Array(n);
@@ -1291,9 +1291,20 @@ export function estimateHaze(frames, Hs, gains, outW, outH) {
       den1[p] = 1; nw++;
     }
     if (nw < 0.02 * nValid) { haze.push(null); continue; }
-    const num2 = num1.slice(), den2 = den1.slice();
+    // far field: a plane per channel (room reflections brighten smoothly toward the light source, so
+    // a gradient extrapolates the unmeasured areas far better than a flat average)
+    const plane = [];
+    {
+      const A = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], B = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+      for (let p = 0; p < n; p++) {
+        if (!den1[p]) continue;
+        const x = (p % w) / w - 0.5, y = ((p / w) | 0) / h - 0.5, f = [1, x, y];
+        for (let i = 0; i < 3; i++) { for (let j = 0; j < 3; j++) A[i][j] += f[i] * f[j]; for (let c = 0; c < 3; c++) B[c][i] += f[i] * num1[p * 3 + c]; }
+      }
+      for (let i = 0; i < 3; i++) A[i][i] += 1e-3 * nw; // mild ridge: keep the slope sane on narrow coverage
+      for (let c = 0; c < 3; c++) { try { plane.push(solveLinear(A.map(r => r.slice()), B[c].slice())); } catch { plane.push([0, 0, 0]); } }
+    }
     blurBox(num1, w, h, 3, r1); blurBox(den1, w, h, 1, r1);
-    blurBox(num2, w, h, 3, r2); blurBox(den2, w, h, 1, r2);
     const soft = new Float32Array(n);
     for (let p = 0; p < n; p++) soft[p] = sh[k][p];
     blurBox(soft, w, h, 1, gaussR(2 * sc));
@@ -1301,7 +1312,9 @@ export function estimateHaze(frames, Hs, gains, outW, outH) {
     for (let p = 0; p < n; p++) {
       const t = Math.min(1, den1[p] / 0.3), keep = 1 - Math.min(1, soft[p]);
       for (let c = 0; c < 3; c++) {
-        const a = den1[p] > 1e-6 ? num1[p * 3 + c] / den1[p] : 0, b = den2[p] > 1e-6 ? num2[p * 3 + c] / den2[p] : 0;
+        const x = (p % w) / w - 0.5, y = ((p / w) | 0) / h - 0.5;
+        const b = plane[c][0] + plane[c][1] * x + plane[c][2] * y;
+        const a = den1[p] > 1e-6 ? num1[p * 3 + c] / den1[p] : b;
         hk[p * 3 + c] = Math.min(60, Math.max(0, t * a + (1 - t) * b)) * keep; // haze only adds light
       }
       hazeSum += (hk[p * 3] + hk[p * 3 + 1] + hk[p * 3 + 2]) / 3;

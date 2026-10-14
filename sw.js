@@ -1,4 +1,4 @@
-const CACHE = 'polascan-v14'; // bump the version whenever ASSETS changes so the precache refreshes
+const CACHE = 'polascan-v16'; // bump the version whenever ASSETS changes so the precache refreshes
 const ASSETS = ['./', './index.html', './style.css', './app.js', './vision.js', './worker.js', './manifest.json', './icon-192.png', './icon-512.png'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS))); self.skipWaiting(); });
 self.addEventListener('activate', e => { e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k))))); self.clients.claim(); });
@@ -9,7 +9,9 @@ self.addEventListener('fetch', e => {
   if (url.pathname.startsWith('/debug') || url.pathname === '/save' || url.pathname.endsWith('/config.json')) return;
   e.respondWith((async () => {
     try {
-      const res = await fetch(e.request);
+      // revalidate with the server: otherwise the browser's heuristic HTTP cache can keep serving an
+      // old worker.js/vision.js (navigations can't take a RequestInit, and are revalidated anyway)
+      const res = await (e.request.mode === 'navigate' ? fetch(e.request) : fetch(e.request, { cache: 'no-cache' }));
       if (res.ok) {
         const copy = res.clone();
         e.waitUntil(caches.open(CACHE).then(cache => cache.put(e.request, copy)));
