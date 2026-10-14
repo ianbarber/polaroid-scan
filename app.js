@@ -16,7 +16,7 @@ for (const f of Object.values(FORMATS)) {
 }
 
 const MAX_FRAMES = 12;
-const SCAN_TIMEOUT_MS = 9000;
+const SCAN_DURATION_MS = 10000;        // fixed-length scan with a countdown; captures are spread across it
 const MAX_CAPTURE_LONG_SIDE = 2600;   // cap stored frame size (memory on phones)
 const DETECT_WIDTH = 640;             // detection works on a 640-wide luma image
 
@@ -425,13 +425,15 @@ function updateStatus() {
   if (performance.now() < stickyUntil) return;
   const fresh = detectedQuad && performance.now() - lastDetectAt < 400;
   if (capturing) {
-    if (!fresh) setStatus(`Scanning ${frames.length}/${MAX_FRAMES} — border lost, bring the print back in view`, 'bad');
-    else if (detInfo.brightFrac > 0.3) setStatus(`Scanning ${frames.length}/${MAX_FRAMES} — big reflection, move so it shifts`, 'warn');
-    else if (detInfo.sharp < 0.5 * sharpRef) setStatus(`Scanning ${frames.length}/${MAX_FRAMES} — slow down, blurry`, 'warn');
-    else if (glareStuck()) setStatus(`Scanning ${frames.length}/${MAX_FRAMES} — reflection isn't moving: tilt a little as you circle`, 'warn');
-    else setStatus(`Scanning ${frames.length}/${MAX_FRAMES} — keep circling slowly over the print`, 'ok');
-    progressBar.style.width = `${(frames.length / MAX_FRAMES) * 100}%`;
-    progressText.textContent = `${frames.length} / ${MAX_FRAMES}`;
+    const elapsed = performance.now() - scanStartT, left = Math.max(0, Math.ceil((SCAN_DURATION_MS - elapsed) / 1000));
+    const head = `Scanning · ${left}s left`;
+    if (!fresh) setStatus(`${head} — border lost, bring the print back in view`, 'bad');
+    else if (detInfo.brightFrac > 0.3) setStatus(`${head} — big reflection, move so it shifts`, 'warn');
+    else if (detInfo.sharp < 0.5 * sharpRef) setStatus(`${head} — slow down, blurry`, 'warn');
+    else if (glareStuck()) setStatus(`${head} — reflection isn't moving: tilt a little as you move`, 'warn');
+    else setStatus(`${head} — keep moving so the phone's reflection slides over every part of the photo`, 'ok');
+    progressBar.style.width = `${Math.min(100, elapsed / SCAN_DURATION_MS * 100)}%`;
+    progressText.textContent = `${left}s · ${frames.length} frames`;
     return;
   }
   if (manualQuad) { setStatus('Manual corners — drag the yellow dots onto the print corners, then tap Scan', 'warn'); return; }
@@ -444,7 +446,7 @@ function updateStatus() {
   editCornersBtn.classList.add('hidden');
   if (detInfo.sharp < 0.5 * sharpRef) setStatus('Hold still — focusing…', 'warn');
   else if (detInfo.brightFrac > 0.25) setStatus('Border found — big reflection, shift or tilt a little', 'warn');
-  else setStatus('Border found ✓ — tap Scan, then slowly circle the phone over the print', 'ok');
+  else setStatus('Border found ✓ — tap Scan, then move the phone around over the print for 10s', 'ok');
 }
 
 // Reflection present in the last few captured frames but sitting still (in print coords)?
@@ -544,9 +546,9 @@ function startScan() {
   stopBtn.textContent = '✕ Cancel';
   progressBox.classList.remove('hidden');
   progressBar.style.width = '0%';
-  progressText.textContent = `0 / ${MAX_FRAMES}`;
-  setStatus('Scanning — hold the phone level and circle it slowly over the print, like stirring', 'ok');
-  scanTimer = setTimeout(() => { if (capturing) finishScan(); }, SCAN_TIMEOUT_MS);
+  progressText.textContent = `${SCAN_DURATION_MS / 1000}s`;
+  setStatus(`Scanning · ${SCAN_DURATION_MS / 1000}s — move the phone around so its reflection slides over every part of the photo`, 'ok');
+  scanTimer = setTimeout(() => { if (capturing) finishScan(); }, SCAN_DURATION_MS);
   if (!autoDetectChk.checked || manualQuad) {
     // no live detection: capture on a timer, rely on alignment refinement for drift
     const sess = scanSession;
@@ -594,7 +596,10 @@ let skipReason = '', scanStartT = 0;
 function maybeAutoCapture(det) {
   if (!capturing || captureBusy) return;
   const now = performance.now();
-  if (now - lastCap < 280) return;
+  // spread captures over the whole scan (the phone's reflection only moves as fast as the user does):
+  // space them by the time left over the frames left, so a few skipped frames are caught up later
+  const timeLeft = SCAN_DURATION_MS - (now - scanStartT), framesLeft = MAX_FRAMES - frames.length;
+  if (now - lastCap < Math.max(280, timeLeft / (framesLeft + 0.5))) return;
   if (det.sharp < 0.5 * sharpRef) { skipReason = 'blurry'; return; }
   if (det.brightFrac > 0.3) { skipReason = 'glare'; return; }
   const q = detectedQuad;

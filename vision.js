@@ -1285,15 +1285,21 @@ export function estimateHaze(frames, Hs, gains, outW, outH) {
     // haze samples: spots shaded in some other frame but not this one
     const num1 = new Float32Array(n * 3), den1 = new Float32Array(n);
     let nw = 0;
+    // reflected room light is near-neutral: measure haze as one grey value (per-channel estimates
+    // tinted the result), and skip a margin at the print edge where alignment mixes in the table
+    const mx = Math.ceil(w * 0.03), my = Math.ceil(h * 0.03);
     for (let p = 0; p < n; p++) {
       if (!anysh[p] || sh[k][p] || !okAt(k, p)) continue;
-      num1[p * 3] = I[k][p * 3] - T[p * 3]; num1[p * 3 + 1] = I[k][p * 3 + 1] - T[p * 3 + 1]; num1[p * 3 + 2] = I[k][p * 3 + 2] - T[p * 3 + 2];
+      const x = p % w, y = (p / w) | 0;
+      if (x < mx || y < my || x >= w - mx || y >= h - my) continue;
+      const g = (I[k][p * 3] - T[p * 3] + I[k][p * 3 + 1] - T[p * 3 + 1] + I[k][p * 3 + 2] - T[p * 3 + 2]) / 3;
+      num1[p * 3] = num1[p * 3 + 1] = num1[p * 3 + 2] = g;
       den1[p] = 1; nw++;
     }
     if (nw < 0.02 * nValid) { haze.push(null); continue; }
     // far field: a plane per channel (room reflections brighten smoothly toward the light source, so
     // a gradient extrapolates the unmeasured areas far better than a flat average)
-    const plane = [];
+    const plane = [], loH = [0, 0, 0], hiH = [0, 0, 0];
     {
       const A = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], B = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
       for (let p = 0; p < n; p++) {
@@ -1302,6 +1308,12 @@ export function estimateHaze(frames, Hs, gains, outW, outH) {
         for (let i = 0; i < 3; i++) { for (let j = 0; j < 3; j++) A[i][j] += f[i] * f[j]; for (let c = 0; c < 3; c++) B[c][i] += f[i] * num1[p * 3 + c]; }
       }
       for (let i = 0; i < 3; i++) A[i][i] += 1e-3 * nw; // mild ridge: keep the slope sane on narrow coverage
+      // observed haze range per channel (10th–90th pct): the extrapolated plane is clamped to it
+      for (let c = 0; c < 3; c++) {
+        const v = []; for (let p = 0; p < n; p += 3) if (den1[p]) v.push(num1[p * 3 + c]);
+        v.sort((a, b) => a - b);
+        loH[c] = v.length ? v[Math.floor(v.length * 0.1)] : 0; hiH[c] = v.length ? v[Math.floor(v.length * 0.9)] : 0;
+      }
       for (let c = 0; c < 3; c++) { try { plane.push(solveLinear(A.map(r => r.slice()), B[c].slice())); } catch { plane.push([0, 0, 0]); } }
     }
     blurBox(num1, w, h, 3, r1); blurBox(den1, w, h, 1, r1);
@@ -1313,7 +1325,7 @@ export function estimateHaze(frames, Hs, gains, outW, outH) {
       const t = Math.min(1, den1[p] / 0.3), keep = 1 - Math.min(1, soft[p]);
       for (let c = 0; c < 3; c++) {
         const x = (p % w) / w - 0.5, y = ((p / w) | 0) / h - 0.5;
-        const b = plane[c][0] + plane[c][1] * x + plane[c][2] * y;
+        const b = Math.min(hiH[c], Math.max(loH[c], plane[c][0] + plane[c][1] * x + plane[c][2] * y)); // no overshoot
         const a = den1[p] > 1e-6 ? num1[p * 3 + c] / den1[p] : b;
         hk[p * 3 + c] = Math.min(60, Math.max(0, t * a + (1 - t) * b)) * keep; // haze only adds light
       }

@@ -28,7 +28,7 @@ The app itself is static files: it also works on any static host (GitHub Pages, 
 
 1. Lay the print flat on a plain surface that **contrasts with its border** (dark table for white borders, light table for black frames) in soft, diffuse light. White, black, and patterned borders all work.
 2. **Start camera** and fit the print in the frame; a **green outline** appears when the border is locked.
-3. Tap **Scan**, hold the phone level, and slowly circle it over the print like stirring a pot. The app auto-captures ~12 frames and asks for a little tilt only if it sees the reflection isn't moving. Finishes on its own; **Finish scan** stops early, **✕ Cancel** discards.
+3. Tap **Scan** and, during the 10-second countdown, move the phone around over the print so its reflections — including the phone's own dark reflection — slide over every part of the photo (wide sweeps beat small circles over the centre). The app spreads ~12 captures across the scan and asks for a little tilt only if it sees the reflection isn't moving. Finishes on its own; **Finish scan** stops early, **✕ Cancel** discards. The fusion also measures the faint room-reflection haze where the phone blocked it and subtracts it everywhere.
 4. The result appears below: **With frame** (default) or **Image only** — an instant toggle. Save to Photos (share sheet on iOS), Download, or Copy. Edge trim / exposure / warmth are display-only; the **glare rejection** slider re-processes the same scan.
 5. If no border is found after a few seconds, tap **✢** and drag the four corners manually — alignment refinement still corrects hand wobble.
 
