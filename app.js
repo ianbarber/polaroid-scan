@@ -212,7 +212,9 @@ let lastDetectAt = 0;
 let detectPending = false;
 let lastDetectTick = 0;
 let lastThresh = null;
-let sharpRef = 0;                // running max of sharpness while border visible (content-adaptive)
+let sharpRef = 0;                // ~80th percentile of sharpness over the last 3 s (content-adaptive)
+let sharpHist = [];              // [{t, s}] recent live sharpness — a running max from a busier print
+                                 // (or one lucky frame) used to mark every frame of the next print "blurry"
 let noDetectSince = 0;
 let manualQuad = null;           // user-dragged override, video px
 let dragIdx = -1;
@@ -268,7 +270,7 @@ async function startCamera() {
   progressBox.classList.add('hidden');
   captureBtn.textContent = '● Scan';
   captureBtn.disabled = false;
-  sharpRef = 0;
+  sharpRef = 0; sharpHist = [];
   setStatus('Looking for the print border…', 'bad');
 }
 
@@ -394,7 +396,10 @@ async function runLiveDetection() {
       detectedQuad = det.quad.map(p => ({ x: p.x / k, y: p.y / k }));
       if (isConfirmed(det)) lastConfirmed = { quad: detectedQuad, t, rotated: !!det.rotated };
       detInfo = det; lastDetectAt = t; lastThresh = det.thresh; noDetectSince = 0;
-      if (det.sharp > sharpRef) sharpRef = det.sharp; else sharpRef = sharpRef * 0.995 + det.sharp * 0.005;
+      sharpHist.push({ t, s: det.sharp });
+      while (sharpHist.length && t - sharpHist[0].t > 3000) sharpHist.shift();
+      const ss = sharpHist.map(h => h.s).sort((a, b) => a - b);
+      sharpRef = ss[Math.floor((ss.length - 1) * 0.8)];
     } else {
       if (t - lastDetectAt > 600) { detectedQuad = null; detInfo = null; }
       if (!noDetectSince) noDetectSince = t;
