@@ -1,11 +1,13 @@
 const CACHE = 'polascan-v16'; // bump the version whenever ASSETS changes so the precache refreshes
 const ASSETS = ['./', './index.html', './style.css', './app.js', './vision.js', './worker.js', './manifest.json', './icon-192.png', './icon-512.png'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS))); self.skipWaiting(); });
-self.addEventListener('activate', e => { e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k))))); self.clients.claim(); });
+self.addEventListener('activate', e => { e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k.startsWith('polascan-') && k !== CACHE).map(k => caches.delete(k))))); self.clients.claim(); });
 // Network-first so edits show up on the next reload; the cache is only the offline fallback.
 self.addEventListener('fetch', e => {
   const url = new URL(e.request.url);
   if (url.origin !== location.origin || e.request.method !== 'GET') return;
+  // The agent dashboard shares this origin but owns its own network/data policy.
+  if (url.pathname === '/agents' || url.pathname.startsWith('/agents/')) return;
   if (url.pathname.startsWith('/debug') || url.pathname === '/save' || url.pathname.endsWith('/config.json')) return;
   e.respondWith((async () => {
     try {
