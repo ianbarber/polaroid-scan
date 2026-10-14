@@ -51,6 +51,10 @@ class Handler(SimpleHTTPRequestHandler):
 
     def end_headers(self):
         self._cors()
+        # always revalidate app files: without this, browsers heuristically cache e.g. worker.js /
+        # vision.js and a phone can keep running old detection code after an update
+        if self.command == "GET" and self.path.split("?")[0].endswith((".js", ".html", ".css", "/")):
+            self.send_header("Cache-Control", "no-cache")
         super().end_headers()
 
     def do_OPTIONS(self):
