@@ -185,7 +185,13 @@ export function detectBorder(luma, W, H, opts) {
   const scratch = opts.scratch || (opts.scratch = {});
   const dbg = opts.debug ? (...a) => console.log('[detect]', ...a) : null;
   let best = null;
-  const consider = r => { if (r && (!best || r.score < best.score)) best = r; };
+  const inView = q => q.every(p => p.x > -0.01 * W && p.y > -0.01 * H && p.x < 1.01 * W && p.y < 1.01 * H);
+  // opts.prefRotated: orientation of recent confirmed detections — a sudden flip is more likely a mis-lock
+  const consider = r => {
+    if (!r || !inView(r.quad)) return;
+    if (opts.prefRotated != null && !!r.rotated !== !!opts.prefRotated && !r.flipPenalised) { r.score += 0.15; r.flipPenalised = true; }
+    if (!best || r.score < best.score) best = r;
+  };
   for (const t of bright) {
     consider(findRing(luma, W, reg, t, expected, scratch, 1));
     if (best && best.score < 0.08) break;
@@ -200,12 +206,16 @@ export function detectBorder(luma, W, H, opts) {
   }
   // silhouette: the print as a whole vs a plain table, by colour distance from the table colour.
   // Catches borders whose luma is neither the brightest nor the darkest thing in view — metallic
-  // (gold/silver foil) frames whose brightness swings with angle, coloured borders, etc.
-  if (!best || best.score > 0.12) {
-    const sil = opts.rgba && tableColour(opts.rgba, W, reg);
-    const sr = sil && findRing(luma, W, reg, sil.thr, expected, scratch, 2, sil, opts.rgba);
-    consider(sr);
-    if (dbg) dbg('after silhouette:', sil ? `bg ${sil.bg.map(Math.round)} thr ${sil.thr.toFixed(0)} own ${sr ? sr.score.toFixed(3) : 'none'}` : 'no plain table', best ? `${best.mode} score ${best.score.toFixed(3)}` : 'none');
+  // (gold/silver foil) frames whose brightness swings with angle, coloured borders, etc. Always
+  // tried (cheap): a ring that scored well can still be the table around a darker border.
+  {
+    const sils = opts.rgba ? tableColour(opts.rgba, W, reg) : [];
+    for (const v of sils.flatMap(t => [t, t.hue])) {
+      const sr = findRing(luma, W, reg, v.thr, expected, scratch, 2, v, opts.rgba);
+      consider(sr);
+      if (dbg) dbg(`silhouette wl ${v.wl}: bg ${v.bg.map(Math.round)} thr ${v.thr.toFixed(0)} own ${sr ? sr.score.toFixed(3) + ' ' + sr.quad.map(p => `${p.x.toFixed(0)},${p.y.toFixed(0)}`).join(' ') + (sr.rotated ? ' rot' : '') : 'none'}`);
+    }
+    if (dbg) dbg('after silhouette:', sils.length ? '' : 'no plain table', best ? `${best.mode} score ${best.score.toFixed(3)}` : 'none');
   }
   if (!best || best.score > 0.2) {
     consider(findByEdges(luma, opts.rgba, W, H, reg, expected, opts.seed, dbg));
@@ -214,8 +224,12 @@ export function detectBorder(luma, W, H, opts) {
   // photo window: when the outer edge is invisible (black frame on a black table, foil reflecting
   // the table), find the picture itself and extend it outward by the format's border geometry
   const fr = opts.borders;
-  if (fr && (!best || best.score > 0.25)) {
-    consider(findViaWindow(luma, opts.rgba, W, H, reg, expected, fr, opts.seed, scratch, dbg));
+  // Also when the best quad is shaped like the photo window rather than the print (a dark photo on a
+  // light table reads as a "black frame"): reinterpret it as the window.
+  const innerR = fr ? expected * (1 - fr.l - fr.r) / (1 - fr.t - fr.b) : 0;
+  const windowShaped = fr && best && quadRatio(best.quad, innerR).err < quadRatio(best.quad, expected).err;
+  if (fr && (!best || best.score > 0.25 || windowShaped)) {
+    consider(findViaWindow(luma, opts.rgba, W, H, reg, expected, fr, opts.seed, scratch, dbg, windowShaped ? best : null));
     if (dbg) dbg('after window:', best ? `${best.mode} score ${best.score.toFixed(3)}` : 'none');
   }
   if (!best || best.score > 0.5) { if (dbg) dbg('REJECT final', best && best.score); return null; }
@@ -254,14 +268,16 @@ export function glareStats(luma, W, H, quad) {
 // Colour distance from the table colour that mostly ignores shading: the chroma part (difference
 // after removing the mean brightness shift) counts fully, the brightness shift itself counts once —
 // so a lighting gradient across a wood table stays "table" while a green or gold border does not.
-function tableDist(r, g, b, bg) {
+// wl < 1 weights brightness less still: for tables whose own brightness varies a lot (wood grain,
+// light patches) while the border differs in hue.
+function tableDist(r, g, b, bg, wl = 1) {
   const dr = r - bg[0], dg = g - bg[1], db = b - bg[2], dl = (dr + dg + db) / 3;
-  return Math.abs(dr - dl) + Math.abs(dg - dl) + Math.abs(db - dl) + Math.abs(dl);
+  return Math.abs(dr - dl) + Math.abs(dg - dl) + Math.abs(db - dl) + wl * Math.abs(dl);
 }
 
-// Table colour = the dominant colour cluster in a thin band around the region's perimeter. Other
+// Table colour = the dominant colour clusters in a thin band around the region's perimeter. Other
 // things at the frame edge (a chair, another print, a rug) are ignored as long as the table is
-// at least ~30% of the perimeter. Returns { bg, thr } or null.
+// at least ~25% of the perimeter. Returns [{ bg, thr, wl, hue }] (possibly empty).
 function tableColour(rgba, W, reg) {
   const m = Math.max(2, Math.round(Math.min(reg.w, reg.h) * 0.03));
   const px = [];
@@ -271,21 +287,38 @@ function tableColour(rgba, W, reg) {
     for (let x = reg.x; x < reg.x + reg.w; x += sx) { push(x, reg.y + d); push(x, reg.y + reg.h - 1 - d); }
     for (let y = reg.y; y < reg.y + reg.h; y += sy) { push(reg.x + d, y); push(reg.x + reg.w - 1 - d, y); }
   }
-  // fullest coarse colour bin seeds the cluster
+  // fullest coarse colour bins seed the clusters; the two biggest (≥25% of the perimeter each) are
+  // both returned — a dark cloth or chair can out-number the table at the frame edge
   const bins = new Map();
   for (const p of px) { const k = (p[0] >> 5) << 6 | (p[1] >> 5) << 3 | (p[2] >> 5); bins.set(k, (bins.get(k) || 0) + 1); }
-  let topK = 0, topN = -1;
-  for (const [k, n] of bins) if (n > topN) { topN = n; topK = k; }
-  let bg = [((topK >> 6) & 7) * 32 + 16, ((topK >> 3) & 7) * 32 + 16, (topK & 7) * 32 + 16];
   const med = a => a.slice().sort((p, q) => p - q)[a.length >> 1];
-  let cl = px;
-  for (let it = 0; it < 3; it++) { // gather the cluster around the seed, re-centre on its median
-    cl = px.filter(p => tableDist(p[0], p[1], p[2], bg) < 45);
-    if (cl.length < 0.3 * px.length) return null; // no dominant plain surface
-    bg = [med(cl.map(p => p[0])), med(cl.map(p => p[1])), med(cl.map(p => p[2]))];
+  const out = [];
+  let rest = px;
+  for (let c = 0; c < 2 && rest.length; c++) {
+    let topK = 0, topN = -1;
+    for (const [k, n] of bins) if (n > topN) { topN = n; topK = k; }
+    if (topN < 0) break;
+    let bg = [((topK >> 6) & 7) * 32 + 16, ((topK >> 3) & 7) * 32 + 16, (topK & 7) * 32 + 16];
+    let cl = rest;
+    for (let it = 0; it < 3; it++) { // gather the cluster around the seed, re-centre on its median
+      cl = rest.filter(p => tableDist(p[0], p[1], p[2], bg) < 45);
+      if (!cl.length) break;
+      bg = [med(cl.map(p => p[0])), med(cl.map(p => p[1])), med(cl.map(p => p[2]))];
+    }
+    if (cl.length < 0.25 * px.length) break; // no (further) dominant plain surface
+    out.push(silFor(bg, cl));
+    rest = rest.filter(p => tableDist(p[0], p[1], p[2], bg) >= 45);
+    bins.clear();
+    for (const p of rest) { const k = (p[0] >> 5) << 6 | (p[1] >> 5) << 3 | (p[2] >> 5); bins.set(k, (bins.get(k) || 0) + 1); }
   }
-  const d = cl.map(p => tableDist(p[0], p[1], p[2], bg)).sort((p, q) => p - q);
-  return { bg, thr: Math.max(30, 3 * d[d.length >> 1], 1.5 * d[Math.floor(d.length * 0.9)]) };
+  return out;
+}
+function silFor(bg, cl) {
+  const thrFor = wl => {
+    const d = cl.map(p => tableDist(p[0], p[1], p[2], bg, wl)).sort((p, q) => p - q);
+    return Math.max(wl < 1 ? 24 : 30, 3 * d[d.length >> 1], 1.5 * d[Math.floor(d.length * 0.9)]);
+  };
+  return { bg, thr: thrFor(1), wl: 1, hue: { bg, thr: thrFor(0.35), wl: 0.35 } };
 }
 
 // pol: 1 = bright ring (white border), -1 = dark ring (black frame),
@@ -301,7 +334,7 @@ function findRing(luma, W, reg, t, expected, scratch, pol, sil = null, rgba = nu
     if (pol === 2) {
       for (let x = 0; x < rw; x++) {
         const i = (row + x) * 4;
-        mask[o + x] = tableDist(rgba[i], rgba[i + 1], rgba[i + 2], sil.bg) > t ? 1 : 0;
+        mask[o + x] = tableDist(rgba[i], rgba[i + 1], rgba[i + 2], sil.bg, sil.wl) > t ? 1 : 0;
       }
     } else for (let x = 0; x < rw; x++) mask[o + x] = (pol > 0 ? luma[row + x] > t : luma[row + x] < t) ? 1 : 0;
   }
@@ -334,6 +367,9 @@ function findRing(luma, W, reg, t, expected, scratch, pol, sil = null, rgba = nu
     const bw = c.maxX - c.minX + 1, bh = c.maxY - c.minY + 1;
     if (bw < 0.22 * rw || bh < 0.22 * rh) continue;
     if (bw > 0.985 * rw && bh > 0.985 * rh) continue; // background
+    // a print being scanned is fully in view; a blob running off two sides of the frame is the
+    // table (e.g. light wood around a darker border reads as a "bright ring" with the print as its hole)
+    if ((c.minX === 0) + (c.maxX === rw - 1) + (c.minY === 0) + (c.maxY === rh - 1) >= 2) continue;
     const P = p => ({ x: p % rw, y: (p / rw) | 0 });
     const TL = P(c.tl), TR = P(c.tr), BR = P(c.br), BL = P(c.bl);
     if (TR.x - TL.x < 0.15 * rw || BR.x - BL.x < 0.15 * rw || BL.y - TL.y < 0.15 * rh || BR.y - TR.y < 0.15 * rh) continue;
@@ -644,7 +680,7 @@ function silBandCheck(rgba, W, H, q, sil) {
   const size = Math.min(Math.hypot(q[1].x - q[0].x, q[1].y - q[0].y), Math.hypot(q[3].x - q[0].x, q[3].y - q[0].y));
   const off = Math.max(2.5, Math.min(8, size * 0.02));
   const px3 = [0, 0, 0];
-  const dist = (x, y) => { sampleRGB(rgba, W, H, x, y, px3); return tableDist(px3[0], px3[1], px3[2], sil.bg); };
+  const dist = (x, y) => { sampleRGB(rgba, W, H, x, y, px3); return tableDist(px3[0], px3[1], px3[2], sil.bg, sil.wl); };
   let on = 0, tot = 0, inSum = 0, outSum = 0;
   for (let i = 0; i < 4; i++) {
     const p0 = q[i], p1 = q[(i + 1) % 4];
@@ -856,12 +892,15 @@ function checkWithWindow(luma, rgba, W, H, best, fr, expected, dbg) {
 // No usable outer edge: find the photo window (a quad with the picture's aspect ratio) and
 // extend it by the border geometry. The chin side is chosen by edge evidence at the implied
 // outer edge, defaulting to chin-at-bottom when there is none (black frame on black table).
-function findViaWindow(luma, rgba, W, H, reg, expected, fr, seed, scratch, dbg) {
+function findViaWindow(luma, rgba, W, H, reg, expected, fr, seed, scratch, dbg, extra = null) {
   if (!rgba) return null;
   const innerRatio = expected * (1 - fr.l - fr.r) / (1 - fr.t - fr.b);
   const cands = [];
-  const sil = tableColour(rgba, W, reg);
-  if (sil) cands.push(findRing(luma, W, reg, sil.thr, innerRatio, scratch, 2, sil, rgba));
+  if (extra) { // scored against the print's ratio; rescore its ratio term against the window's
+    const go = quadRatio(extra.quad, expected), gi = quadRatio(extra.quad, innerRatio);
+    cands.push({ ...extra, score: extra.score - 1.5 * go.err + 1.5 * gi.err });
+  }
+  for (const sil of tableColour(rgba, W, reg)) cands.push(findRing(luma, W, reg, sil.thr, innerRatio, scratch, 2, sil, rgba));
   cands.push(findByEdges(luma, rgba, W, H, reg, innerRatio, seed, null));
   let best = null;
   for (const c of cands) {

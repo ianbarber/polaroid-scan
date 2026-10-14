@@ -148,16 +148,16 @@ class VisionClient {
       this.worker.postMessage({ ...msg, id }, transfer || []);
     });
   }
-  async detect(rgba, w, h, region, expectedRatio, lastThresh, seed, borders) {
+  async detect(rgba, w, h, region, expectedRatio, lastThresh, seed, borders, prefRotated = null) {
     if (!this.inline) {
-      try { return await this._call({ type: 'detect', rgba: rgba.buffer, w, h, region, expectedRatio, lastThresh, seed, borders }, [rgba.buffer]); }
+      try { return await this._call({ type: 'detect', rgba: rgba.buffer, w, h, region, expectedRatio, lastThresh, seed, borders, prefRotated }, [rgba.buffer]); }
       catch (e) {
         if (!this.inline) throw e;
         return null; // buffer was transferred before the worker died — skip this tick, next one runs inline
       }
     }
     const luma = V.rgbaToLuma(rgba, w * h);
-    return V.detectBorder(luma, w, h, { region, expectedRatio, lastThresh, seed, borders, rgba, scratch: this._scratch });
+    return V.detectBorder(luma, w, h, { region, expectedRatio, lastThresh, seed, borders, prefRotated, rgba, scratch: this._scratch });
   }
   async fuse(frames, opts, onProgress) {
     if (!this.inline) {
@@ -373,12 +373,26 @@ async function runLiveDetection() {
     const region = { x: proc.width * 0.01, y: proc.height * 0.01, w: proc.width * 0.98, h: proc.height * 0.98 };
     const gr0 = computeGuideRect();
     const seed = { x: gr0.x * k, y: gr0.y * k, w: gr0.w * k, h: gr0.h * k };
-    let det = await vision.detect(img.data, proc.width, proc.height, region, currentFormat().outerRatio, lastThresh, seed, currentFormat().borderFrac);
+    const fmt = currentFormat();
+    const recent = lastConfirmed && performance.now() - lastConfirmed.t < 1500;
+    const pref = recent ? lastConfirmed.rotated : null;
+    let det = null;
+    if (recent) {
+      // track: search around the last confirmed outline first — keeps clutter at the frame edges
+      // (cloth, chair, other prints) out of the table-colour estimate and the candidate set
+      const xs = lastConfirmed.quad.map(p => p.x * k), ys = lastConfirmed.quad.map(p => p.y * k);
+      const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+      const mx = (x1 - x0) * 0.3, my = (y1 - y0) * 0.3;
+      const tr = { x: Math.max(0, x0 - mx), y: Math.max(0, y0 - my) };
+      tr.w = Math.min(proc.width, x1 + mx) - tr.x; tr.h = Math.min(proc.height, y1 + my) - tr.y;
+      det = await vision.detect(new Uint8ClampedArray(img.data), proc.width, proc.height, tr, fmt.outerRatio, lastThresh, seed, fmt.borderFrac, pref);
+    }
+    if (!det) det = await vision.detect(img.data, proc.width, proc.height, region, fmt.outerRatio, lastThresh, seed, fmt.borderFrac, pref);
     const t = performance.now();
     if (det && implausibleJump(det, det.quad.map(p => ({ x: p.x / k, y: p.y / k })))) det = null;
     if (det) {
       detectedQuad = det.quad.map(p => ({ x: p.x / k, y: p.y / k }));
-      if (isConfirmed(det)) lastConfirmed = { quad: detectedQuad, t };
+      if (isConfirmed(det)) lastConfirmed = { quad: detectedQuad, t, rotated: !!det.rotated };
       detInfo = det; lastDetectAt = t; lastThresh = det.thresh; noDetectSince = 0;
       if (det.sharp > sharpRef) sharpRef = det.sharp; else sharpRef = sharpRef * 0.995 + det.sharp * 0.005;
     } else {
@@ -525,7 +539,7 @@ function startScan() {
   if (!resultPanel.classList.contains('hidden')) { resultPanel.classList.add('hidden'); currentResult = null; }
   frames = []; strip.innerHTML = ''; glareTrail = [];
   scanSession++;
-  capturing = true; firstArea = 0; scanRotated = false; lastCap = 0;
+  capturing = true; firstArea = 0; scanRotated = false; lastCap = 0; scanStartT = performance.now();
   captureBtn.textContent = 'Finish scan';
   stopBtn.textContent = '✕ Cancel';
   progressBox.classList.remove('hidden');
@@ -576,7 +590,7 @@ async function saveLostFrame(reason) {
 }
 
 // Gate auto-capture on a fresh live detection: sharp enough, not blown out, moved since the last frames.
-let skipReason = '';
+let skipReason = '', scanStartT = 0;
 function maybeAutoCapture(det) {
   if (!capturing || captureBusy) return;
   const now = performance.now();
@@ -584,6 +598,9 @@ function maybeAutoCapture(det) {
   if (det.sharp < 0.5 * sharpRef) { skipReason = 'blurry'; return; }
   if (det.brightFrac > 0.3) { skipReason = 'glare'; return; }
   const q = detectedQuad;
+  // the first frame sets the size/orientation every later frame is checked against, so prefer one
+  // the photo window confirmed; settle for unconfirmed only if none comes within 1.5 s
+  if (!frames.length && !isConfirmed(det) && now - scanStartT < 1500) { skipReason = 'waiting for a confirmed border'; return; }
   if (frames.length) {
     if (det.rotated !== scanRotated) { skipReason = 'rotated'; return; }
     const area = V.quadArea(q);
@@ -638,10 +655,11 @@ async function doCapture(liveQuad) {
       // detect() transfers the pixel buffer to the worker, so keep a copy for a full-frame retry —
       // the print may have moved out of the hint region between the live detection and the photo
       const copy = new Uint8ClampedArray(simg.data);
-      det = await vision.detect(simg.data, DETECT_WIDTH, dh, region, currentFormat().outerRatio, lastThresh, region, currentFormat().borderFrac);
+      const pref = frames.length ? scanRotated : (lastConfirmed ? lastConfirmed.rotated : null);
+      det = await vision.detect(simg.data, DETECT_WIDTH, dh, region, currentFormat().outerRatio, lastThresh, region, currentFormat().borderFrac, pref);
       if (!det && sess === scanSession) {
         const full = { x: DETECT_WIDTH * 0.01, y: dh * 0.01, w: DETECT_WIDTH * 0.98, h: dh * 0.98 };
-        det = await vision.detect(copy, DETECT_WIDTH, dh, full, currentFormat().outerRatio, lastThresh, region, currentFormat().borderFrac);
+        det = await vision.detect(copy, DETECT_WIDTH, dh, full, currentFormat().outerRatio, lastThresh, region, currentFormat().borderFrac, pref);
       }
     }
     if (sess !== scanSession) return;

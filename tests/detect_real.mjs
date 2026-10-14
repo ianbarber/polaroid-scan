@@ -18,10 +18,11 @@ for (let y = 0; y < th; y++) for (let x = 0; x < tw; x++) {
   luma[y * tw + x] = 0.299 * sr / c + 0.587 * sg / c + 0.114 * sb / c;
 }
 // region: the app's guide is ~72% of viewport width, centred. Here just use the central 90%.
-const region = { x: tw * 0.05, y: th * 0.03, w: tw * 0.9, h: th * 0.94 };
+const REG = process.env.REG ? process.env.REG.split(',').map(Number) : null; // print bbox fractions x0,y0,x1,y1 → tracking region (+30%)
+const region = REG ? (() => { const mx = (REG[2] - REG[0]) * 0.3, my = (REG[3] - REG[1]) * 0.3, x0 = Math.max(0, REG[0] - mx) * tw, y0 = Math.max(0, REG[1] - my) * th; return { x: x0, y: y0, w: Math.min(1, REG[2] + mx) * tw - x0, h: Math.min(1, REG[3] + my) * th - y0 }; })() : process.env.FULL ? { x: tw * 0.01, y: th * 0.01, w: tw * 0.98, h: th * 0.98 } : { x: tw * 0.05, y: th * 0.03, w: tw * 0.9, h: th * 0.94 };
 const t0 = Date.now();
 const seed = { x: tw * 0.15, y: th * 0.1, w: tw * 0.7, h: th * 0.8 };
-const det = V.detectBorder(luma, tw, th, { region, expectedRatio: 88 / 107, rgba, seed, debug: !!process.env.DBG, borders: process.env.NOWIN ? null : { l: 4.5 / 88, r: 4.5 / 88, t: 6 / 107, b: 22 / 107 } });
+const det = V.detectBorder(luma, tw, th, { region, expectedRatio: 88 / 107, rgba, seed, debug: !!process.env.DBG, prefRotated: process.env.PREF ? process.env.PREF === '1' : null, borders: process.env.NOWIN ? null : { l: 4.5 / 88, r: 4.5 / 88, t: 6 / 107, b: 22 / 107 } });
 console.log(`${raw}: ${Date.now() - t0}ms`, det ? { mode: det.mode, thresh: det.thresh, score: det.score.toFixed(3), inliers: det.inliers.toFixed(2), ratio: det.ratio.toFixed(3), centerFill: det.centerFill.toFixed(2), band: det.band, sharp: det.sharp.toFixed(0), quad: det.quad.map(p => `${(p.x * s).toFixed(0)},${(p.y * s).toFixed(0)}`).join(' ') } : 'NO DETECTION');
 if (det && outPng) {
   const out = data.slice();
