@@ -1350,6 +1350,26 @@ function subtractHaze(buf, outW, bh, y0, hz, hk) {
   }
 }
 
+// Per-frame detail on the aligned frames: mean squared Laplacian at half resolution over the central
+// part of the print (not glare). Captures taken mid-movement or mid-focus are visibly softer, and
+// averaging them in equally washes out fine detail like small text.
+export function alignedSharpness(frames, Hs, outW, outH) {
+  const S = 2, x0 = Math.round(outW * 0.15), y0 = Math.round(outH * 0.1), w = Math.round(outW * 0.7 / S), h = Math.round(outH * 0.6 / S);
+  const b = new Float32Array(w * h * 3), v = new Uint8Array(w * h), l = new Float32Array(w * h);
+  return frames.map((f, k) => {
+    warpPatch(f, Hs[k], x0, y0, w, h, S, b, v);
+    lumaOfRGB(b, w * h, l);
+    let sum = 0, n = 0;
+    for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      if (!v[i] || !v[i - 1] || !v[i + 1] || !v[i - w] || !v[i + w] || l[i] > 235) continue;
+      const lap = 4 * l[i] - l[i - 1] - l[i + 1] - l[i - w] - l[i + w];
+      sum += lap * lap; n++;
+    }
+    return n ? sum / n : 0;
+  });
+}
+
 export function fuseAligned(frames, Hs, gains, outW, outH, opts = {}) {
   const K = frames.length;
   const glarePct = opts.glarePct == null ? 65 : opts.glarePct;
@@ -1360,6 +1380,7 @@ export function fuseAligned(frames, Hs, gains, outW, outH, opts = {}) {
   const refPct = Math.min(0.5, Math.max(0.02, 0.5 - glarePct / 200));
   const refIdx = Math.round((K - 1) * refPct);
   const lum = new Float32Array(K), idx = new Uint8Array(K);
+  const wts = opts.weights || null; // per-frame weight in the final average (sharper frames count more)
   for (let y0 = 0; y0 < outH; y0 += BAND) {
     const bh = Math.min(BAND, outH - y0);
     for (let k = 0; k < K; k++) {
@@ -1397,8 +1418,8 @@ export function fuseAligned(frames, Hs, gains, outW, outH, opts = {}) {
           const L = lum[a];
           if (L < lo) continue;
           if (L > hi) break;
-          const b = bufs[idx[a]];
-          r += b[p3]; g += b[p3 + 1]; bb += b[p3 + 2]; c++;
+          const b = bufs[idx[a]], wt = wts ? wts[idx[a]] : 1;
+          r += b[p3] * wt; g += b[p3 + 1] * wt; bb += b[p3 + 2] * wt; c += wt;
         }
         out[o] = lastR = r / c; out[o + 1] = lastG = g / c; out[o + 2] = lastB = bb / c; out[o + 3] = 255;
       }
@@ -1516,9 +1537,13 @@ export function fusePipeline(framesIn, opts) {
   prog('fuse', 0);
   const t1 = now();
   const haze = opts.dehaze === false ? null : estimateHaze(frames, Hs, gains, outW, outH);
-  const fused = fuseAligned(frames, Hs, gains, outW, outH, { glarePct: opts.glarePct, haze, onProgress: f => prog('fuse', f) });
+  // sharpness weights: (s/smax)^3, floor 0.05 — soft frames still help reject glare, but barely blur
+  const sharp = alignedSharpness(frames, Hs, outW, outH), smax = Math.max(...sharp, 1e-6);
+  const weights = opts.sharpWeight === false ? null : sharp.map(s => Math.max(0.05, (s / smax) ** 3));
+  for (let k = 0; k < diag.length; k++) diag[k].sharp = +(sharp[k] / smax).toFixed(2);
+  const fused = fuseAligned(frames, Hs, gains, outW, outH, { glarePct: opts.glarePct, haze, weights, onProgress: f => prog('fuse', f) });
   const tFuse = now() - t1;
-  return finishPipeline(fused, { ...opts, Hs, gains, haze, diag, dropped, used: frames.map(f => f.idx), timing: { align: tAlign, fuse: tFuse } });
+  return finishPipeline(fused, { ...opts, Hs, gains, haze, weights, diag, dropped, used: frames.map(f => f.idx), timing: { align: tAlign, fuse: tFuse } });
 }
 
 // Rotate RGBA by 90° clockwise (dir=1) or counter-clockwise (dir=-1).
@@ -1574,7 +1599,7 @@ export function finishPipeline(fused, opts) {
   // rect so the UI can offer frame/no-frame instantly without re-processing.
   if (opts.borders) crop = refineInnerCrop(fused.data, fused.w, fused.h, opts.borders);
   if (opts.sharpen) img = { data: unsharp(img.data, img.w, img.h, opts.sharpen), w: img.w, h: img.h };
-  return { data: img.data, w: img.w, h: img.h, crop, Hs: opts.Hs, gains: opts.gains, haze: opts.haze || null, hazeInfo: opts.haze ? opts.haze.info : null, diag: opts.diag, dropped: opts.dropped || [], used: opts.used, timing: opts.timing };
+  return { data: img.data, w: img.w, h: img.h, crop, Hs: opts.Hs, gains: opts.gains, weights: opts.weights || null, haze: opts.haze || null, hazeInfo: opts.haze ? opts.haze.info : null, diag: opts.diag, dropped: opts.dropped || [], used: opts.used, timing: opts.timing };
 }
 
 function now() { return (typeof performance !== 'undefined' ? performance.now() : Date.now()); }

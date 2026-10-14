@@ -18,15 +18,15 @@ self.onmessage = (e) => {
       const frames = m.frames.map(f => ({ data: new Uint8ClampedArray(f.data), w: f.w, h: f.h, quad: f.quad, sharp: f.sharp }));
       const opts = m.opts;
       const res = V.fusePipeline(frames, { ...opts, onProgress: (stage, f) => self.postMessage({ id: m.id, type: 'progress', stage, f }) });
-      session = { frames, opts, Hs: res.Hs, gains: res.gains, haze: res.haze, diag: res.diag, used: res.used, dropped: res.dropped };
+      session = { frames, opts, Hs: res.Hs, gains: res.gains, haze: res.haze, weights: res.weights, diag: res.diag, used: res.used, dropped: res.dropped };
       post(m.id, 'fuse', res);
     } else if (m.type === 'refuse') {
       if (!session) throw new Error('nothing to re-fuse');
       const frames = session.used.map(i => session.frames[i]);
       const opts = { ...session.opts, ...m.opts };
       const { outW, outH } = session.opts;
-      const fused = V.fuseAligned(frames, session.Hs, session.gains, outW, outH, { glarePct: opts.glarePct, haze: session.haze, onProgress: f => self.postMessage({ id: m.id, type: 'progress', stage: 'fuse', f }) });
-      const res = V.finishPipeline(fused, { ...opts, Hs: session.Hs, gains: session.gains, haze: session.haze, diag: session.diag, dropped: session.dropped, used: session.used });
+      const fused = V.fuseAligned(frames, session.Hs, session.gains, outW, outH, { glarePct: opts.glarePct, haze: session.haze, weights: session.weights, onProgress: f => self.postMessage({ id: m.id, type: 'progress', stage: 'fuse', f }) });
+      const res = V.finishPipeline(fused, { ...opts, Hs: session.Hs, gains: session.gains, haze: session.haze, weights: session.weights, diag: session.diag, dropped: session.dropped, used: session.used });
       post(m.id, 'refuse', res);
     } else if (m.type === 'reset') {
       session = null;

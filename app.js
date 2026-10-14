@@ -174,8 +174,8 @@ class VisionClient {
     const s = this._session; if (!s) throw new Error('nothing to re-fuse');
     const used = s.res.used.map(i => s.frames[i]);
     const o = { ...s.opts, ...opts };
-    const fused = V.fuseAligned(used, s.res.Hs, s.res.gains, s.opts.outW, s.opts.outH, { glarePct: o.glarePct, haze: s.res.haze, onProgress: f => onProgress && onProgress('fuse', f) });
-    return V.finishPipeline(fused, { ...o, Hs: s.res.Hs, gains: s.res.gains, haze: s.res.haze, diag: s.res.diag, dropped: s.res.dropped, used: s.res.used });
+    const fused = V.fuseAligned(used, s.res.Hs, s.res.gains, s.opts.outW, s.opts.outH, { glarePct: o.glarePct, haze: s.res.haze, weights: s.res.weights, onProgress: f => onProgress && onProgress('fuse', f) });
+    return V.finishPipeline(fused, { ...o, Hs: s.res.Hs, gains: s.res.gains, haze: s.res.haze, weights: s.res.weights, diag: s.res.diag, dropped: s.res.dropped, used: s.res.used });
   }
   // Free the retained fusion inputs (frames can be 50-100 MB on hi-res scans).
   reset() {

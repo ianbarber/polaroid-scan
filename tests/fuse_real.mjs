@@ -14,5 +14,6 @@ const borders = { l: 4.5 / 88, r: 4.5 / 88, t: 6 / 107, b: 22 / 107 };
 const t = Date.now();
 const res = V.fusePipeline(frames, { outW, outH, glarePct: gp == null ? 65 : +gp, borders, autoCrop: false, sharpen: 0, dehaze: !process.env.NODEHAZE, onProgress: () => { } });
 console.log('haze', JSON.stringify(res.hazeInfo));
+console.log('sharp', res.diag.map(d => d.sharp).join(' '));
 console.log(`${frames.length} frames, ${Date.now() - t}ms, dropped ${JSON.stringify(res.dropped)}`);
 writePNG(out, res.data, res.w, res.h);
